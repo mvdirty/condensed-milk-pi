@@ -15,12 +15,23 @@ const TIMESTAMP_PATTERNS = [
   /^\d{2}:\d{2}:\d{2}[.\d]*\s*/,
 ];
 
-function stripTimestamp(line: string): string {
+// Dynamic value patterns (from RTK) — normalize for better dedup matching
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const HEX_RE = /0x[0-9a-f]+/gi;
+const LARGE_NUM_RE = /\b\d{4,}\b/g;
+
+function normalize(line: string): string {
+  let s = line;
+  // Strip timestamps
   for (const p of TIMESTAMP_PATTERNS) {
-    const match = p.exec(line);
-    if (match) return line.slice(match[0].length);
+    const match = p.exec(s);
+    if (match) { s = s.slice(match[0].length); break; }
   }
-  return line;
+  // Normalize dynamic values for matching (not for display)
+  s = s.replace(UUID_RE, "<UUID>");
+  s = s.replace(HEX_RE, "<HEX>");
+  s = s.replace(LARGE_NUM_RE, "<NUM>");
+  return s;
 }
 
 function filterLogOutput(input: string): FilterResult | null {
@@ -39,7 +50,7 @@ function filterLogOutput(input: string): FilterResult | null {
     if (line.length === 0) continue;
     if (emitted >= 100) break;
 
-    const canonical = stripTimestamp(line);
+    const canonical = normalize(line);
 
     if (canonical === prevCanonical && canonical.length > 0) {
       dupCount++;

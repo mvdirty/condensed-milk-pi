@@ -23,6 +23,7 @@ import "./filters/env.js";
 import "./filters/python-traceback.js";
 import "./filters/log-dedup.js";
 import "./filters/tsc.js";
+import "./filters/json-schema.js";
 import { compressStaleToolResults } from "./filters/context-compress.js";
 
 export default function tokenCompressor(pi: ExtensionAPI) {
