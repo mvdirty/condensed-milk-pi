@@ -66,7 +66,7 @@ export function dispatch(command: string, stdout: string): FilterResult | null {
         if (result && result.output.length < stdout.length) {
           return result;
         }
-        return null; // Matched but filter declined or output grew
+        break; // Matched but filter declined — fall through to content fallbacks
       }
     }
   }

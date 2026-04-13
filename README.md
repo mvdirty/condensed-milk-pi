@@ -2,7 +2,7 @@
 
 **Semantic token compression for [pi terminal](https://github.com/badlogic/pi-mono).** Cuts LLM token consumption by compressing bash tool output and retroactively shrinking stale conversation history.
 
-Inspired by [ztk](https://github.com/codejunkie99/ztk) (a Zig-based CLI proxy for Claude Code), rebuilt as a native pi extension using `tool_result` post-processing and pi's `context` event — capabilities that a standalone proxy cannot have.
+Inspired by [ztk](https://github.com/codejunkie99/ztk) (Zig) and [RTK](https://github.com/rtk-ai/rtk) (Rust) — standalone CLI proxies for Claude Code — rebuilt as a native pi extension using `tool_result` post-processing and pi's `context` event. This architecture gives Condensed Milk capabilities that standalone proxies structurally cannot have.
 
 ## What It Does
 
@@ -25,6 +25,9 @@ Intercepts bash command output before the model sees it and applies semantic com
 | Python traceback | Full stack trace | First 2 + last 2 frames + exception | ~50% |
 | `tsc` | Verbose TS errors | Grouped by file, 3 samples each | ~60% |
 | Log output | Repeated lines with timestamps | Collapsed to `line [xN]` | Variable |
+| JSON output (>1KB) | Full values, deeply nested | Keys + types + array lengths | ~80% |
+
+**Log dedup normalization** (from RTK): UUIDs, hex addresses, and large numbers are normalized before dedup matching, so lines differing only in request IDs or memory addresses collapse together.
 
 ### Context Retroactive Compression
 
@@ -107,6 +110,7 @@ condensed-milk/
 │   ├── python-traceback.ts     # Python crash output
 │   ├── log-dedup.ts            # journalctl, tail, docker logs, tmux
 │   ├── tsc.ts                  # TypeScript compiler
+│   ├── json-schema.ts          # JSON structure extraction (content-based)
 │   └── context-compress.ts     # Retroactive context compression
 └── package.json
 ```
@@ -153,19 +157,43 @@ These filters exist in [ztk](https://github.com/codejunkie99/ztk) but are intent
 
 **Contributing stack-specific filters is welcome.** The dispatch system is designed for easy extension — register a prefix and a function.
 
-## vs ztk
+## vs ztk and RTK
 
-| | ztk | Condensed Milk |
-|---|-----|----------------|
-| Architecture | Standalone Zig binary, Claude Code PreToolUse hook | Native pi extension, tool_result + context hooks |
-| Context compression | ❌ Cannot access conversation history | ✅ Retroactively compresses stale results (biggest savings) |
-| Read compression | ❌ N/A | ✅ Smart file-ops-aware staleness |
-| Secret masking | ❌ | ✅ |
-| Session dedup | ✅ mmap shared memory | Unnecessary (context compression subsumes it) |
-| Code filtering | ✅ (strips function bodies) | ❌ (intentionally — harmful for coding agents) |
-| Performance | ⚡ Zig + SIMD | Fast enough (TypeScript on <50KB post-truncation) |
-| Stack coverage | Broad (Rust, Go, Zig, Docker, K8s) | Python/TypeScript/Git focused |
-| Install | Homebrew / zig build | Copy to ~/.pi/agent/extensions/ |
+| | [ztk](https://github.com/codejunkie99/ztk) | [RTK](https://github.com/rtk-ai/rtk) | Condensed Milk |
+|---|-----|-----|----------------|
+| Language | Zig | Rust | TypeScript |
+| Target | Claude Code | Claude Code | pi terminal |
+| Architecture | Standalone binary, PreToolUse hook | Standalone binary, PreToolUse hook | Native extension, tool_result + context hooks |
+| Context compression | ❌ | ❌ | ✅ Retroactively compresses stale results (**biggest savings**) |
+| Read compression | ❌ | ✅ Language-aware file filtering | ✅ Smart file-ops-aware staleness (keeps files being edited) |
+| Secret masking | ❌ | ❌ | ✅ env filter masks API keys/tokens/passwords |
+| JSON structure | ❌ | ✅ Schema extraction | ✅ Content-based schema extraction |
+| Session dedup | ✅ mmap shared memory | ❌ | Unnecessary (context compression subsumes it) |
+| Code filtering | ✅ Strips function bodies | ✅ 3 filter levels (None/Minimal/Aggressive) | ❌ Intentionally — harmful for coding agents |
+| TOML filter DSL | ❌ | ✅ 60+ declarative filters | ❌ All filters are code |
+| Log normalization | Timestamps only | ✅ UUIDs, hex, numbers, paths | ✅ UUIDs, hex, numbers (from RTK) |
+| Adaptive learning | ❌ | ✅ Mistake detection + suggestions | ❌ |
+| Analytics | ❌ | ✅ Rich per-day/week/month + API cost | Basic session stats in status bar |
+| Traceback compression | ❌ | ❌ (pytest only) | ✅ Generic Python traceback (first 2 + last 2 frames) |
+| Performance | ⚡ Zig + SIMD | ⚡ Rust | Fast enough (TypeScript on <50KB post-truncation) |
+| Stack coverage | Broad (Rust, Go, Zig, Docker, K8s) | Very broad (60+ TOML filters) | Python/TypeScript/Git focused |
+| Install | Homebrew / zig build | Homebrew / cargo install | Copy to ~/.pi/agent/extensions/ |
+
+### Where Condensed Milk wins
+
+- **Context retroactive compression** — ztk and RTK are standalone proxies that only see output once. Condensed Milk compresses stale tool results in conversation history before each LLM call. This saved **1.4MB in a single session** — more than all tool-result filters combined.
+- **Smart read staleness** — tracks file operations across the session. Keeps reads where the file was subsequently edited (model is working on it). Compresses old exploratory reads.
+- **Python traceback compression** — generic crash output compression (first 2 + last 2 frames + exception). RTK only has pytest-specific filtering. Handles Python 3.13 pointer lines.
+- **Secret masking** — prevents API keys from entering the LLM context sent to Anthropic.
+- **Compound command dispatch** — handles `source && pytest | tail` chains that real coding sessions produce.
+
+### Where RTK wins
+
+- **Breadth** — 60+ TOML filters covering Rust, Go, .NET, Ruby, Docker, K8s, Terraform, Ansible, and more.
+- **TOML DSL** — declarative filter definitions with `strip_lines_matching`, `match_output`, `max_lines`, and inline tests.
+- **Adaptive learning** — watches for repeated CLI mistakes and suggests corrections.
+- **Analytics** — rich per-day/week/month reporting with API cost integration.
+- **File read filtering** — language-aware comment/import stripping (though we consider this harmful for coding agents).
 
 ## Measured Results
 
