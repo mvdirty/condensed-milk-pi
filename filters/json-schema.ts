@@ -73,4 +73,5 @@ function describeType(value: unknown): string {
   return typeof value;
 }
 
-registerFilter("jq", filterJsonOutput, "fast");
+// Exported for use as a content-based fallback in dispatch
+export { filterJsonOutput };

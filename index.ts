@@ -9,7 +9,7 @@
  * Filters are registered by individual modules at import time.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { dispatch, registeredCommands } from "./filters/dispatch.js";
+import { dispatch, registeredCommands, registerContentFallback } from "./filters/dispatch.js";
 
 // Import filter modules — each self-registers via registerFilter()
 import "./filters/pytest.js";
@@ -23,10 +23,13 @@ import "./filters/env.js";
 import "./filters/python-traceback.js";
 import "./filters/log-dedup.js";
 import "./filters/tsc.js";
-import "./filters/json-schema.js";
+import { filterJsonOutput } from "./filters/json-schema.js";
 import { compressStaleToolResults } from "./filters/context-compress.js";
 
 export default function tokenCompressor(pi: ExtensionAPI) {
+  // Register content-based fallback filters
+  registerContentFallback("json", filterJsonOutput);
+
   // Subagents: compress too — they benefit from smaller output
   let totalOriginal = 0;
   let totalCompressed = 0;

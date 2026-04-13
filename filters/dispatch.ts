@@ -70,6 +70,13 @@ export function dispatch(command: string, stdout: string): FilterResult | null {
       }
     }
   }
+
+  // No command-prefix match — try content-based fallbacks
+  for (const fb of contentFallbacks) {
+    const result = fb.filter(stdout, command);
+    if (result && result.output.length < stdout.length) return result;
+  }
+
   return null;
 }
 
@@ -105,7 +112,18 @@ function commandMatches(command: string, spec: string): boolean {
   return command.length === spec.length || command[spec.length] === " " || command[spec.length] === "\t";
 }
 
+// Content-based fallback filters (not command-prefix based)
+let contentFallbacks: Array<{ name: string; filter: FilterFn }> = [];
+
+/**
+ * Register a content-based fallback filter that runs when no
+ * command-prefix filter matches. Used for JSON detection, etc.
+ */
+export function registerContentFallback(name: string, filter: FilterFn): void {
+  contentFallbacks.push({ name, filter });
+}
+
 /** List registered filter commands (for debugging/stats). */
 export function registeredCommands(): string[] {
-  return specs.map((s) => s.command);
+  return [...specs.map((s) => s.command), ...contentFallbacks.map((f) => `*${f.name}`)];
 }
