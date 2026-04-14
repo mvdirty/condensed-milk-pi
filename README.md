@@ -2,13 +2,15 @@
 
 **Semantic token compression for [pi terminal](https://github.com/badlogic/pi-mono).** Cuts LLM token consumption by compressing bash tool output and retroactively shrinking stale conversation history.
 
-Inspired by [ztk](https://github.com/codejunkie99/ztk) (Zig) and [RTK](https://github.com/rtk-ai/rtk) (Rust) — standalone CLI proxies for Claude Code — rebuilt as a native pi extension using `tool_result` post-processing and pi's `context` event. This architecture gives Condensed Milk capabilities that standalone proxies structurally cannot have.
+Inspired by [ztk](https://github.com/codejunkie99/ztk) (Zig) and [RTK](https://github.com/rtk-ai/rtk) (Rust) — standalone CLI proxies for Claude Code — rebuilt as a native pi extension using `tool_result` post-processing and pi's `context` event. ANSI stripping, linter aggregation, and grep grouping techniques adapted from [pi-rtk-optimizer](https://github.com/MasuRii/pi-rtk-optimizer) by MasuRii. This architecture gives Condensed Milk capabilities that standalone proxies structurally cannot have.
 
 ## What It Does
 
 ### Tool Result Compression
 
 Intercepts bash command output before the model sees it and applies semantic compression — not blind truncation but domain-aware filters that preserve meaning while dropping noise.
+
+**ANSI escape codes are stripped from ALL bash output** before any other filter runs — zero information loss, pure token savings.
 
 | Command | Before | After | Savings |
 |---------|--------|-------|---------|
@@ -19,7 +21,8 @@ Intercepts bash command output before the model sees it and applies semantic com
 | `git add/commit/push` | Transfer progress, CRLF warnings | `ok abc1234` | ~90% |
 | `ls -la` (>20 files) | Permission bits, dates, owners | Extension counts + first 10 names | ~80% |
 | `find` (>30 results) | Full path listing | Dir/type summary + first 15 paths | ~70% |
-| `grep/rg` (>30 matches) | All matches | File summary + first 10 matches | ~65% |
+| `grep/rg` (>15 matches) | All matches | Grouped by file, match counts, lines truncated to 70 chars | ~65% |
+| `eslint/ruff/mypy/pylint` | Verbose per-file errors | Error/warning counts, top rules, top files | ~70% |
 | `tree` | Full tree with noise dirs | Stripped `.git/node_modules/.venv/__pycache__` | ~50-90% |
 | `env` | All variables, secrets in plain text | Secrets masked, values truncated | ~60% + security |
 | Python traceback | Full stack trace | First 2 + last 2 frames + exception | ~50% |
@@ -45,6 +48,36 @@ Pi's `context` event fires before every LLM call with a deep copy of the convers
 - Compressed reads preserve the file path + first 3 lines (imports/header)
 
 In practice, this saves **hundreds of KB per session** from stale file reads and old command outputs — effectively doubling context runway before compaction.
+
+#### Cache-Aware Mode
+
+Retroactive compression modifies conversation history, which can invalidate Anthropic's prompt cache. Enable cache-aware mode to defer compression until the cache TTL expires:
+
+```
+/compress-config cache-aware on     # Wait for cache TTL before compressing
+/compress-config cache-ttl 300      # Set TTL in seconds (default: 300 = 5min)
+```
+
+When enabled, the context hook checks the timestamp of the last assistant message. If less than the TTL has passed, compression is skipped — the cache stays warm. Once the cache goes cold (idle for >5 min), compression runs freely.
+
+Use `/compress-stats` to see whether cache-aware mode is helping your session:
+
+```
+Cache Impact
+  Total input: 175.99M
+  Cache hits:   162.72M (92.5%) @ $1.50/M = $244.08
+  Cache writes: 13.27M  (7.5%)  @ $18.75/M = $248.78
+  Uncached:     924     (0.0%)  @ $15/M = $0.01
+
+Tradeoff
+  Context freed: 865.8KB (~221.6K tokens)
+  Cache-aware: ON (TTL: 300s)
+  Compressions skipped (cache warm): 4
+
+Recent turns (last 5):
+  T7: hit 92% | write 8% | read 356K | new 30K | compressed 77KB
+  T8: hit 95% | write 5% | read 380K | new 20K | compressed 0B [cache-wait]
+```
 
 ### Compound Command Handling
 
@@ -86,25 +119,41 @@ The extension works automatically — no configuration needed. Every bash comman
 
 | Command | Description |
 |---------|-------------|
-| `/compress-stats` | Show compression statistics for the current session |
+| `/compress-stats` | Show compression statistics, cache impact analysis, and per-turn breakdown |
+| `/compress-config` | View current configuration |
+| `/compress-config cache-aware on\|off` | Enable/disable cache-aware compression (default: off) |
+| `/compress-config cache-ttl <seconds>` | Set cache TTL in seconds (default: 300) |
 
 ### Status Bar
 
 Shows a running total: `↓12.5KB saved (15/42 cmds, 68%)`
 
+### Cache Impact Analysis
+
+`/compress-stats` shows full cache tradeoff data:
+
+- **Cache hit rate** — percentage of input tokens served from Anthropic's prompt cache
+- **Cache writes** — tokens where new cache entries were created (potential invalidation indicator)
+- **Cost breakdown** — per-category costs at Opus 4.6 pricing
+- **Per-turn history** — last 5 turns showing hit/write rates and compression amounts
+- **`[cache-wait]` tags** — turns where compression was skipped due to cache-aware mode
+
 ## Architecture
 
 ```
 condensed-milk/
-├── index.ts                    # Extension entry — tool_result + context hooks
+├── index.ts                    # Extension entry — tool_result + context hooks + cache instrumentation
 ├── filters/
 │   ├── dispatch.ts             # Command matching + compound splitting
+│   ├── ansi-strip.ts           # ANSI escape code removal (runs on ALL bash output)
 │   ├── pytest.ts               # pytest/python -m pytest
 │   ├── git-status.ts           # git status (porcelain v1/v2/plain)
 │   ├── git-diff.ts             # git diff (strip headers, condense context)
 │   ├── git-mutations.ts        # git add/commit/push
 │   ├── git-log.ts              # git log (verbose → hash subject)
-│   ├── file-ops.ts             # ls, find, grep, rg
+│   ├── file-ops.ts             # ls, find
+│   ├── grep-grouping.ts        # grep/rg result grouping by file
+│   ├── linter.ts               # eslint/ruff/mypy/pylint/flake8/clippy aggregation
 │   ├── tree.ts                 # tree (strip noise dirs)
 │   ├── env.ts                  # env/printenv (mask secrets)
 │   ├── python-traceback.ts     # Python crash output
@@ -117,11 +166,13 @@ condensed-milk/
 
 ### How It Works
 
-1. **`tool_result` hook** — runs after pi's built-in 50KB truncation, before the model sees the output. Matches the command against registered filters and returns compressed content.
+1. **`tool_result` hook** — runs after pi's built-in 50KB truncation, before the model sees the output. First strips ANSI codes from all bash output, then matches the command against registered filters and returns compressed content. Preserves non-text content blocks (e.g., images).
 
-2. **`context` event hook** — runs before each LLM API call. Walks the conversation history, identifies stale tool results (bash >8 turns, read with smart file-ops tracking), and replaces them with compressed summaries.
+2. **`context` event hook** — runs before each LLM API call. Walks the conversation history, identifies stale tool results (bash >8 turns, read with smart file-ops tracking), and replaces them with compressed summaries. Optionally defers compression when prompt cache is warm (cache-aware mode).
 
 3. **Filter dispatch** — splits compound commands, strips pipes/redirects/env vars, and matches against registered filter prefixes. Longest prefix wins. Filters return `null` to decline (output passes through unchanged).
+
+4. **Cache instrumentation** — tracks per-turn cache hit rates, cache write rates, and compression amounts. Reports cumulative cost analysis at Opus 4.6 pricing via `/compress-stats`.
 
 ### Adding Filters
 
@@ -137,7 +188,7 @@ function filterMyCommand(input: string): FilterResult | null {
 registerFilter("my-command", filterMyCommand, "fast");
 ```
 
-Categories: `"fast"` (ls, grep), `"medium"` (test runners), `"slow"` (git log), `"immutable"` (never changes), `"mutation"` (git add/commit/push).
+Categories: `"fast"` (ls, grep), `"medium"` (test runners, linters), `"slow"` (git log), `"immutable"` (never changes), `"mutation"` (git add/commit/push).
 
 ## What's NOT Supported
 
@@ -154,38 +205,52 @@ These filters exist in [ztk](https://github.com/codejunkie99/ztk) but are intent
 | `curl` JSON schema | Too risky — model often needs actual values |
 | `make`, `terraform`, `helm`, `gradle`, `mvn`, `dotnet`, etc. | 25 regex-based runtime filters for stacks we don't use. See ztk for patterns. |
 | Session dedup (mmap) | Context retroactive compression handles this more effectively |
+| Source code filtering | **Harmful for coding agents.** Stripping comments/bodies from file reads breaks the model's ability to write correct edits. RTK offers this as an option but we intentionally skip it. |
 
 **Contributing stack-specific filters is welcome.** The dispatch system is designed for easy extension — register a prefix and a function.
 
-## vs ztk and RTK
+## vs ztk, RTK, and pi-rtk-optimizer
 
-| | [ztk](https://github.com/codejunkie99/ztk) | [RTK](https://github.com/rtk-ai/rtk) | Condensed Milk |
-|---|-----|-----|----------------|
-| Language | Zig | Rust | TypeScript |
-| Target | Claude Code | Claude Code | pi terminal |
-| Architecture | Standalone binary, PreToolUse hook | Standalone binary, PreToolUse hook | Native extension, tool_result + context hooks |
-| Context compression | ❌ | ❌ | ✅ Retroactively compresses stale results (**biggest savings**) |
-| Read compression | ❌ | ✅ Language-aware file filtering | ✅ Smart file-ops-aware staleness (keeps files being edited) |
-| Secret masking | ❌ | ❌ | ✅ env filter masks API keys/tokens/passwords |
-| JSON structure | ❌ | ✅ Schema extraction | ✅ Content-based schema extraction |
-| Session dedup | ✅ mmap shared memory | ❌ | Unnecessary (context compression subsumes it) |
-| Code filtering | ✅ Strips function bodies | ✅ 3 filter levels (None/Minimal/Aggressive) | ❌ Intentionally — harmful for coding agents |
-| TOML filter DSL | ❌ | ✅ 60+ declarative filters | ❌ All filters are code |
-| Log normalization | Timestamps only | ✅ UUIDs, hex, numbers, paths | ✅ UUIDs, hex, numbers (from RTK) |
-| Adaptive learning | ❌ | ✅ Mistake detection + suggestions | ❌ |
-| Analytics | ❌ | ✅ Rich per-day/week/month + API cost | Basic session stats in status bar |
-| Traceback compression | ❌ | ❌ (pytest only) | ✅ Generic Python traceback (first 2 + last 2 frames) |
-| Performance | ⚡ Zig + SIMD | ⚡ Rust | Fast enough (TypeScript on <50KB post-truncation) |
-| Stack coverage | Broad (Rust, Go, Zig, Docker, K8s) | Very broad (60+ TOML filters) | Python/TypeScript/Git focused |
-| Install | Homebrew / zig build | Homebrew / cargo install | Copy to ~/.pi/agent/extensions/ |
+| | [ztk](https://github.com/codejunkie99/ztk) | [RTK](https://github.com/rtk-ai/rtk) | [pi-rtk-optimizer](https://github.com/MasuRii/pi-rtk-optimizer) | Condensed Milk |
+|---|-----|-----|-----|----------------|
+| Language | Zig | Rust | TypeScript | TypeScript |
+| Target | Claude Code | Claude Code | pi terminal | pi terminal |
+| Architecture | Standalone binary | Standalone binary | Native extension, tool_result hook | Native extension, tool_result + context hooks |
+| Context compression | ❌ | ❌ | ❌ | ✅ Retroactively compresses stale results (**biggest savings**) |
+| Cache-aware mode | ❌ | ❌ | ❌ | ✅ Defers compression until cache TTL expires |
+| Cache instrumentation | ❌ | ❌ | ❌ | ✅ Per-turn hit/write rates + cost analysis |
+| ANSI stripping | ❌ | ❌ | ✅ | ✅ (adapted from pi-rtk-optimizer) |
+| Linter aggregation | ❌ | ❌ | ✅ | ✅ (adapted from pi-rtk-optimizer) |
+| Search/grep grouping | ❌ | ❌ | ✅ | ✅ (adapted from pi-rtk-optimizer) |
+| Read compression | ❌ | ✅ Language-aware filtering | ✅ Source code filtering | ✅ Smart file-ops-aware staleness |
+| Secret masking | ❌ | ❌ | ❌ | ✅ env filter masks API keys/tokens/passwords |
+| JSON structure | ❌ | ✅ Schema extraction | ❌ | ✅ Content-based schema extraction |
+| Session dedup | ✅ mmap shared memory | ❌ | ❌ | Unnecessary (context compression subsumes it) |
+| Code filtering | ✅ Strips function bodies | ✅ 3 filter levels | ✅ Minimal/aggressive | ❌ Intentionally — harmful for coding agents |
+| Command rewriting | ❌ | ❌ | ✅ (`--no-pager`, etc.) | ❌ |
+| TOML filter DSL | ❌ | ✅ 60+ declarative filters | ❌ | ❌ All filters are code |
+| Log normalization | Timestamps only | ✅ UUIDs, hex, numbers, paths | ❌ | ✅ UUIDs, hex, numbers (from RTK) |
+| Adaptive learning | ❌ | ✅ Mistake detection + suggestions | ❌ | ❌ |
+| Analytics | ❌ | ✅ Rich per-day/week/month + API cost | ✅ Basic savings metrics | ✅ Cache-aware cost analysis |
+| Traceback compression | ❌ | ❌ (pytest only) | ❌ | ✅ Generic Python traceback |
+| Stack coverage | Broad (Rust, Go, Zig, Docker, K8s) | Very broad (60+ TOML filters) | Moderate | Python/TypeScript/Git focused |
+| Install | Homebrew / zig build | Homebrew / cargo install | npm | Copy to ~/.pi/agent/extensions/ |
 
 ### Where Condensed Milk wins
 
-- **Context retroactive compression** — ztk and RTK are standalone proxies that only see output once. Condensed Milk compresses stale tool results in conversation history before each LLM call. This saved **1.4MB in a single session** — more than all tool-result filters combined.
+- **Context retroactive compression** — ztk, RTK, and pi-rtk-optimizer only see output once. Condensed Milk compresses stale tool results in conversation history before each LLM call. This saved **9.4MB in a single session** — more than all tool-result filters combined.
+- **Cache-aware mode** — defers retroactive compression until the provider's prompt cache TTL expires, preserving cache hit rates while still freeing context.
+- **Cache instrumentation** — built-in per-turn analysis showing cache hit rate, write rate, cost breakdown, and tradeoff metrics. No other tool provides this visibility.
 - **Smart read staleness** — tracks file operations across the session. Keeps reads where the file was subsequently edited (model is working on it). Compresses old exploratory reads.
 - **Python traceback compression** — generic crash output compression (first 2 + last 2 frames + exception). RTK only has pytest-specific filtering. Handles Python 3.13 pointer lines.
 - **Secret masking** — prevents API keys from entering the LLM context sent to Anthropic.
 - **Compound command dispatch** — handles `source && pytest | tail` chains that real coding sessions produce.
+
+### Where pi-rtk-optimizer wins
+
+- **Command rewriting** — rewrites commands to add `--no-pager`, `--color=never`, etc. before execution.
+- **Source code filtering** — language-aware comment/import stripping for file reads (though we consider this harmful for coding agents).
+- **Smart truncate** — content-aware truncation preserving signatures and imports.
 
 ### Where RTK wins
 
@@ -193,7 +258,6 @@ These filters exist in [ztk](https://github.com/codejunkie99/ztk) but are intent
 - **TOML DSL** — declarative filter definitions with `strip_lines_matching`, `match_output`, `max_lines`, and inline tests.
 - **Adaptive learning** — watches for repeated CLI mistakes and suggests corrections.
 - **Analytics** — rich per-day/week/month reporting with API cost integration.
-- **File read filtering** — language-aware comment/import stripping (though we consider this harmful for coding agents).
 
 ## Measured Results
 
@@ -201,13 +265,27 @@ From a real coding session:
 
 ```
 Token Compressor Stats
-  Commands processed: 42
-  Commands compressed: 15
-  Original: 11.0KB → Compressed: 4.8KB (56% saved)
-  Context retroactive: 1.4MB saved (8 compressions)
+  Commands processed: 88
+  Commands compressed: 13
+  Original: 4.4KB → Compressed: 1.4KB (68% saved)
+  Context retroactive: 9.4MB saved (163 compressions)
+
+Cache Impact
+  Total input: 175.99M
+  Cache hits:   162.72M (92.5%) @ $1.50/M = $244.08
+  Cache writes: 13.27M  (7.5%)  @ $18.75/M = $248.78
+  Uncached:     924     (0.0%)  @ $15/M = $0.01
+  Session cost: $508.02
+  vs no cache:  $2704.78 (saving $2196.76)
 ```
 
-The context retroactive compression is the dominant savings — **1.4MB in one session** from compressing stale file reads and old command outputs.
+The context retroactive compression is the dominant savings — **9.4MB in one session** from compressing stale file reads and old command outputs.
+
+## Attribution
+
+- **[ztk](https://github.com/codejunkie99/ztk)** — original inspiration for the CLI proxy approach to token compression
+- **[RTK](https://github.com/rtk-ai/rtk)** — log normalization techniques (UUID, hex, number dedup)
+- **[pi-rtk-optimizer](https://github.com/MasuRii/pi-rtk-optimizer)** by MasuRii — ANSI stripping, linter output aggregation, and search/grep result grouping techniques adapted for Condensed Milk. Cache-aware compression approach inspired by community discussion with warren.
 
 ## License
 
