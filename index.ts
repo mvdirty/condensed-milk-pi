@@ -9,6 +9,9 @@
  * Filters are registered by individual modules at import time.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, dirname } from "node:path";
 import { dispatch, registeredCommands, registerContentFallback } from "./filters/dispatch.js";
 
 // Import filter modules — each self-registers via registerFilter()
@@ -39,6 +42,30 @@ const DEFAULT_CONFIG: CompressorConfig = {
   cacheAware: false,
   cacheTtlMs: 300_000,
 };
+
+const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
+
+function loadConfig(): CompressorConfig {
+  try {
+    const raw = readFileSync(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    return {
+      cacheAware: typeof parsed.cacheAware === "boolean" ? parsed.cacheAware : DEFAULT_CONFIG.cacheAware,
+      cacheTtlMs: typeof parsed.cacheTtlMs === "number" ? parsed.cacheTtlMs : DEFAULT_CONFIG.cacheTtlMs,
+    };
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+function saveConfig(cfg: CompressorConfig): void {
+  try {
+    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+  } catch {
+    // Non-fatal — config just won't persist
+  }
+}
 
 // --- Cache tradeoff instrumentation ---
 interface TurnCacheData {
@@ -333,9 +360,11 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       if (key === "cache-aware") {
         if (value === "on" || value === "true" || value === "1") {
           config.cacheAware = true;
+          saveConfig(config);
           ctx.ui?.notify?.(`Cache-aware compression: ON (TTL: ${config.cacheTtlMs / 1000}s)`, "info");
         } else if (value === "off" || value === "false" || value === "0") {
           config.cacheAware = false;
+          saveConfig(config);
           ctx.ui?.notify?.("Cache-aware compression: OFF", "info");
         } else {
           ctx.ui?.notify?.("Usage: /compress-config cache-aware on|off", "warning");
@@ -350,6 +379,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           return;
         }
         config.cacheTtlMs = seconds * 1000;
+        saveConfig(config);
         ctx.ui?.notify?.(`Cache TTL set to ${seconds}s`, "info");
         return;
       }
