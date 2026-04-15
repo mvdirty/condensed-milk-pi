@@ -18,6 +18,18 @@ import { dispatch } from "./dispatch.js";
 
 const STALE_THRESHOLD = 8;
 const MIN_COMPRESS_LENGTH = 200;
+
+/**
+ * Command invalidation rules.
+ * When a command in the 'invalidator' pattern runs, any preceding bash output
+ * matching 'invalidated' pattern becomes immediately stale (no turn threshold).
+ */
+const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[] = [
+  { invalidator: /^git\s+(add|rm|checkout|reset|stash|merge|rebase|cherry-pick)\b/, invalidated: /^git\s+status\b/ },
+  { invalidator: /^git\s+(commit|merge|rebase)\b/, invalidated: /^git\s+(diff|log)\b/ },
+  { invalidator: /^(npm|pnpm|yarn|bun)\s+(install|add|remove)\b/, invalidated: /^(npm|pnpm|yarn|bun)\s+(ls|list|outdated)\b/ },
+  { invalidator: /^pip\s+install\b/, invalidated: /^pip\s+(list|freeze)\b/ },
+];
 const MAX_SUMMARY_LENGTH = 150;
 
 /** Files that should never be compressed — reference docs, configs */
@@ -156,14 +168,20 @@ export function compressStaleToolResults(messages: any[]): any[] | null {
     const msg = m?.message ?? m;
     if (msg?.role === "user") currentTurn++;
 
-    // === BASH COMPRESSION (same as before, turn-based) ===
-    if (idx < staleBeforeIdx && isBashToolResult(msg) && !msg.isError) {
+    // === BASH COMPRESSION (turn-based + command invalidation) ===
+    if (isBashToolResult(msg) && !msg.isError) {
       const content = extractTextContent(msg);
       if (content.length >= MIN_COMPRESS_LENGTH && !content.startsWith("[compressed]")) {
         const command = msg.details?.command ?? (msg as any)?.input?.command ?? "";
-        const summary = compressBashContent(command, content);
-        modified = true;
-        return replaceContent(m, `[compressed] ${summary}`);
+
+        // Check if this command's output was invalidated by a later command
+        const isInvalidated = idx < staleBeforeIdx || isCommandInvalidated(command, currentTurn, messages, idx);
+
+        if (isInvalidated) {
+          const summary = compressBashContent(command, content);
+          modified = true;
+          return replaceContent(m, `[compressed] ${summary}`);
+        }
       }
     }
 
@@ -190,6 +208,23 @@ export function compressStaleToolResults(messages: any[]): any[] | null {
   return modified ? result : null;
 }
 
+/**
+ * Check if a bash command's output has been invalidated by a subsequent command.
+ * Scans forward from the command's position for invalidating commands.
+ */
+function isCommandInvalidated(command: string, _currentTurn: number, messages: any[], fromIdx: number): boolean {
+  const applicableRules = INVALIDATION_RULES.filter((r) => r.invalidated.test(command));
+  if (applicableRules.length === 0) return false;
+
+  for (let i = fromIdx + 1; i < messages.length; i++) {
+    const m = messages[i]?.message ?? messages[i];
+    if (!isBashToolResult(m)) continue;
+    const laterCmd = m.details?.command ?? (m as any)?.input?.command ?? "";
+    if (applicableRules.some((r) => r.invalidator.test(laterCmd))) return true;
+  }
+  return false;
+}
+
 function isBashToolResult(msg: any): boolean {
   return msg?.role === "toolResult" && msg?.toolName === "bash";
 }
@@ -209,10 +244,16 @@ function compressBashContent(command: string, content: string): string {
   const compressed = dispatch(command, content);
   if (compressed) return compressed.output;
 
-  // Fallback: line count + first line preview
+  // Fallback: line count + first 3 + last 3 lines preview
   const lines = content.split("\n").filter((l: string) => l.length > 0);
-  const preview = lines[0]?.slice(0, 80) ?? "";
-  let summary = `${lines.length} lines: ${preview}${lines.length > 1 ? ` ... +${lines.length - 1} more` : ""}`;
+  if (lines.length <= 6) {
+    let summary = `${lines.length} lines: ${lines[0]?.slice(0, 80) ?? ""}`;
+    if (summary.length > MAX_SUMMARY_LENGTH) summary = summary.slice(0, MAX_SUMMARY_LENGTH) + "...";
+    return summary;
+  }
+  const head = lines.slice(0, 3).map((l: string) => l.slice(0, 80)).join("\n");
+  const tail = lines.slice(-3).map((l: string) => l.slice(0, 80)).join("\n");
+  let summary = `${lines.length} lines:\n${head}\n... +${lines.length - 6} more ...\n${tail}`;
   if (summary.length > MAX_SUMMARY_LENGTH) summary = summary.slice(0, MAX_SUMMARY_LENGTH) + "...";
   return summary;
 }

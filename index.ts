@@ -28,6 +28,9 @@ import "./filters/log-dedup.js";
 import "./filters/tsc.js";
 import "./filters/linter.js";
 import "./filters/grep-grouping.js";
+import "./filters/build.js";
+import "./filters/test-runners.js";
+import "./filters/install.js";
 import { filterJsonOutput } from "./filters/json-schema.js";
 import { compressStaleToolResults } from "./filters/context-compress.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
@@ -88,8 +91,11 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let compressedCount = 0;
   let totalCommands = 0;
 
-  // Config
-  let config: CompressorConfig = { ...DEFAULT_CONFIG };
+  // Config — load persisted settings, auto-detect cache TTL from pi
+  let config: CompressorConfig = loadConfig();
+  if (process.env.PI_CACHE_RETENTION === "long" && config.cacheTtlMs === DEFAULT_CONFIG.cacheTtlMs) {
+    config.cacheTtlMs = 3_600_000; // 1 hour to match pi's extended cache
+  }
 
   // Cache tracking
   let cacheHistory: TurnCacheData[] = [];

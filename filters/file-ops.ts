@@ -138,44 +138,8 @@ function getDirectoryPrefix(path: string): string {
   return parts.length > 1 ? parts.slice(0, 2).join("/") : parts[0];
 }
 
-// ─── grep / rg ─────────────────────────────────────────────────────────
-
-function filterGrep(input: string): FilterResult | null {
-  if (input.length === 0) return null;
-
-  const lines = input.split("\n").filter((l) => l.length > 0);
-  if (lines.length <= 30) return null;
-
-  // Group by file
-  const byFile = new Map<string, number>();
-  for (const line of lines) {
-    const colon = line.indexOf(":");
-    if (colon > 0) {
-      const file = line.slice(0, colon);
-      byFile.set(file, (byFile.get(file) ?? 0) + 1);
-    }
-  }
-
-  if (byFile.size === 0) return null;
-
-  const sorted = [...byFile.entries()].sort((a, b) => b[1] - a[1]);
-  const parts: string[] = [`${lines.length} matches in ${byFile.size} files`];
-
-  const fileSummaries = sorted.slice(0, 10).map(([file, count]) => `  ${file}: ${count} matches`);
-  parts.push(...fileSummaries);
-  if (sorted.length > 10) parts.push(`  +${sorted.length - 10} more files`);
-
-  // Append first 10 raw match lines so the model can act immediately
-  parts.push("");
-  const firstMatches = lines.slice(0, 10).map((line) => `  ${line}`);
-  parts.push(...firstMatches);
-  if (lines.length > 10) parts.push(`  ... +${lines.length - 10} more (narrow your query)`);
-
-  return { output: parts.join("\n"), category: "fast" };
-}
+// grep/rg now handled by grep-grouping.ts — removed duplicate
 
 // Register
 registerFilter("ls", filterLs, "fast");
 registerFilter("find", filterFind, "fast");
-registerFilter("grep", filterGrep, "fast");
-registerFilter("rg", filterGrep, "fast");
