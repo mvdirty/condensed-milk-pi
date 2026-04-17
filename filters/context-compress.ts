@@ -44,16 +44,38 @@ const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[
   { invalidator: /^pip\s+install\b/, invalidated: /^pip\s+(list|freeze)\b/ },
 ];
 
-/** Reference files — docs the model relies on across turns. Never masked. */
-const REFERENCE_FILES = new Set([
-  "AGENTS.md", "CONVENTIONS.md", "CLAUDE.md",
+/** Basenames always treated as reference — never masked. */
+const REFERENCE_BASENAMES = new Set([
+  // Agent instructions
+  "AGENTS.md", "CONVENTIONS.md", "CLAUDE.md", "GEMINI.md",
+  "SKILL.md",
+  // Lint/format config
   ".ruff.toml", "ruff.toml", "biome.json",
   "pyproject.toml", "package.json", "tsconfig.json",
   "sgconfig.yml", ".shellcheckrc",
+  // Project meta often re-read across a session
+  "README.md", "CHANGELOG.md",
 ]);
 
+/** Path substrings — any file under these trees is reference.
+ *  Covers Obsidian vault knowledge (ADRs, concepts, patterns),
+ *  agent skills, and AST rule definitions. */
+const REFERENCE_PATH_SUBSTRINGS: readonly string[] = [
+  "/knowledge/decisions/",
+  "/knowledge/concepts/",
+  "/knowledge/patterns/",
+  "/.pi/agent/skills/",
+  "/.pi/skills/",
+  "/rules/",
+];
+
 function isReferenceFile(path: string): boolean {
-  return REFERENCE_FILES.has(path.split("/").pop() ?? path);
+  const base = path.split("/").pop() ?? path;
+  if (REFERENCE_BASENAMES.has(base)) return true;
+  for (const sub of REFERENCE_PATH_SUBSTRINGS) {
+    if (path.includes(sub)) return true;
+  }
+  return false;
 }
 
 /** Count newlines + 1 (matches `wc -l` + 1 semantics for non-trailing-newline files). */

@@ -2,6 +2,51 @@
 
 All notable changes to condensed-milk.
 
+## [1.5.0] - 2026-04-17
+
+### Changed — expanded reference-file protection
+
+`REFERENCE_FILES` was exact-basename match only, which missed the most
+frequently re-read categories in real sessions:
+
+- Per-project decision records under `knowledge/decisions/`
+- Shared vault concepts and patterns
+- Agent skill entry points (`SKILL.md`)
+- AST rule definitions under `rules/`
+
+**Change:** `isReferenceFile` now checks two sources:
+
+1. **Basename set** (unchanged semantics, expanded list): added `SKILL.md`,
+   `GEMINI.md`, `README.md`, `CHANGELOG.md` alongside existing
+   `AGENTS.md`, `CONVENTIONS.md`, `CLAUDE.md`, etc.
+2. **Path substrings** (new): any path containing `/knowledge/decisions/`,
+   `/knowledge/concepts/`, `/knowledge/patterns/`, `/.pi/agent/skills/`,
+   `/.pi/skills/`, or `/rules/` is treated as reference.
+
+### Why it's cache-safe
+
+Expanding protection only reduces the masked set; it does not change
+the placeholder text for any file that still gets masked. Sweep on a
+real 926-message session at the default T.20/.35/.50 × C.50/.75/.90
+config:
+
+- Variants: 42 → 42 (unchanged)
+- Cost: ≈ identical ($116.21)
+
+### Tests
+
+`test-rereads.mjs` gains a reference-path block: seeds reads for
+ADR paths, skill files, rule files, and project meta, forces zone 2
+(most aggressive masking), and asserts none end up in `maskedPaths`
+nor carry a `[masked read]` placeholder.
+
+### Deferred to v1.6.0
+
+JSON config file (`~/.pi/agent/condensed-milk-config.json`) for
+user-defined basenames/substrings/globs, and dynamic promotion of
+frequently-read paths. Hardcoded list ships now because the common
+cases are covered and the config plumbing is larger than the fix.
+
 ## [1.4.0] - 2026-04-17
 
 ### Fixed — re-read telemetry bugs exposed by real-session data

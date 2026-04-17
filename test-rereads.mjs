@@ -139,4 +139,53 @@ if (firstPlaceholders.join("|") !== secondPlaceholders.join("|")) {
 }
 console.log("Determinism: OK (same input produces byte-identical placeholders)");
 
-console.log("\nPASS — v1.4.0 enriched read placeholder + determinism.");
+// v1.5.0: reference-path protection — certain paths must NEVER be masked
+// even when they fall before the cutoff. Covers basenames (SKILL.md,
+// README.md) and path substrings (/knowledge/decisions/, /.pi/agent/skills/,
+// /rules/).
+const refMessages = [];
+const refPaths = [
+  "/proj/knowledge/decisions/023-foo.md",
+  "/proj/knowledge/concepts/dod.md",
+  "/home/u/.pi/agent/skills/review/SKILL.md",
+  "/proj/rules/no-broad-except.yml",
+  "/proj/README.md",
+  "/proj/CHANGELOG.md",
+  "/proj/AGENTS.md",
+];
+for (let i = 0; i < 8; i++) {
+  refMessages.push(userMsg(`ref turn ${i}`));
+  refMessages.push(asstMsg(`calling read`, [{ id: `rc_${i}`, args: { path: refPaths[i % refPaths.length] } }], { input: 50000 }));
+  refMessages.push(readResult(`rc_${i}`, refPaths[i % refPaths.length], long));
+}
+const refResult = compressStaleToolResults(refMessages, {
+  thresholds: [0.20, 0.35, 0.50],
+  coverage: [0.50, 0.75, 0.90],
+  contextUsage: 0.50,
+  previousCutoff: 0,
+  zoneEntered: -1,
+});
+if (refResult) {
+  const leakedRefs = refResult.maskedPaths.filter(p => refPaths.includes(p));
+  if (leakedRefs.length > 0) {
+    console.error("FAIL: reference paths were masked:", leakedRefs);
+    process.exit(1);
+  }
+  for (const m of refResult.messages) {
+    const msg = m?.message ?? m;
+    if (msg?.role !== "toolResult" || msg?.toolName !== "read") continue;
+    const text = msg.content?.[0]?.text ?? "";
+    if (!text.startsWith("[masked read]")) continue;
+    const pathMatch = /^\[masked read\] (\S+)/.exec(text);
+    const maskedPath = pathMatch?.[1];
+    if (maskedPath && refPaths.includes(maskedPath)) {
+      console.error("FAIL: reference path has masked placeholder:", maskedPath);
+      process.exit(1);
+    }
+  }
+  console.log(`Reference protection: OK (${refPaths.length} ref paths survived masking)`);
+} else {
+  console.log("Reference protection: OK (no masks applied — all reads protected)");
+}
+
+console.log("\nPASS — v1.5.0 enriched placeholder + determinism + reference protection.");
