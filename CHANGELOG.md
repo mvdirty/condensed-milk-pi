@@ -2,6 +2,23 @@
 
 All notable changes to condensed-milk.
 
+## [1.6.1] - 2026-04-17
+
+### Fixed — re-read rate display (>100% confusion)
+
+v1.4.0 telemetry reported `Re-read rate: reads 108.3%` on a long
+session. >100% is legal (same path can be re-read multiple times)
+but reading it as a percentage is confusing — the row crosses the
+"rate" mental model. Changed to a ratio with × notation:
+
+```
+  Re-read ratio: reads 1.08× | bashes 0.00× (events per unique mask)
+```
+
+Values above 1.0× indicate at least one mask was re-read multiple
+times. Cosmetic only — no behavior change. Data in `Unique masks`
+and `Re-read events` rows is unchanged.
+
 ## [1.6.0] - 2026-04-17
 
 ### Fixed — cd-prefix invisibility + cwd-unaware invalidation

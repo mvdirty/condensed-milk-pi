@@ -428,7 +428,11 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Unique masks: ${everMaskedReads.size} reads, ${everMaskedBashes.size} bashes`,
         `  Currently tracked: ${maskedReadPaths.size} reads, ${maskedBashCommands.size} bashes (evicted on re-read)`,
         `  Re-read events: ${reReadByRead + reReadByBash} (${reReadByRead} reads, ${reReadByBash} bashes)`,
-        `  Re-read rate: reads ${everMaskedReads.size > 0 ? ((reReadByRead / everMaskedReads.size) * 100).toFixed(1) : "0.0"}% | bashes ${everMaskedBashes.size > 0 ? ((reReadByBash / everMaskedBashes.size) * 100).toFixed(1) : "0.0"}%`,
+        // v1.6.1: ratio (events / unique) not percentage. Can legally
+        // exceed 1.0× when the same path is re-read multiple times, which
+        // was confusing as a percentage ("108%"). × notation makes the
+        // >1 case natural.
+        `  Re-read ratio: reads ${everMaskedReads.size > 0 ? (reReadByRead / everMaskedReads.size).toFixed(2) : "0.00"}× | bashes ${everMaskedBashes.size > 0 ? (reReadByBash / everMaskedBashes.size).toFixed(2) : "0.00"}× (events per unique mask)`,
         `  Avg turns placeholder held: ${(reReadByRead + reReadByBash) > 0 ? (reReadTurnsDeltaSum / (reReadByRead + reReadByBash)).toFixed(1) : "—"}`,
         "",
         "Cache Impact",
