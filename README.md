@@ -29,31 +29,40 @@ Intercepts bash command output before the model sees it and applies semantic com
 
 **Log dedup normalization** (from RTK): UUIDs, hex addresses, and large numbers are normalized before dedup matching, so lines differing only in request IDs or memory addresses collapse together.
 
-### Context Retroactive Compression (v1.1.0: observation masking)
+### Context Retroactive Compression (v1.6.0: static-cutoff masking + cwd-aware invalidation)
 
 The killer feature that standalone proxies **cannot** do.
 
 Pi's `context` event fires before every LLM call with a deep copy of the conversation history. Condensed Milk retroactively masks old tool results so the model sees a short deterministic placeholder instead of the original payload.
 
-**Algorithm: fixed rolling window of last N messages (default 10) kept in full. Older tool results are replaced with:**
+**Algorithm (v1.2.0+ static cutoff, ADR-018):** a cutoff index T advances only when context usage crosses a pressure threshold. Between advances T is immutable — bytes before T stay byte-identical turn-over-turn — cache prefix stable. Defaults: thresholds `[0.20, 0.35, 0.50]` of context used, coverage `[0.50, 0.75, 0.90]` of messages masked at each zone.
 
-- `[masked bash] <command>` — for bash results
-- `[masked read] <path>` — for read results
+**Placeholders:**
 
-**Reference files never get masked:** AGENTS.md, CONVENTIONS.md, CLAUDE.md, package.json, tsconfig.json, pyproject.toml, biome.json, ruff config, etc.
+- `[masked bash] <command truncated to 80 chars>` — for bash results
+- `[masked read] <path> (N lines, SIZE)` — for read results (v1.4.0: size metadata helps the model decide whether to re-read)
 
-**Command invalidation still fires immediately:** `git add` invalidates any preceding `git status` output regardless of window position; `pip install` invalidates `pip list`; etc.
+**Reference files are never masked.** v1.6.0 protects by basename set (`AGENTS.md`, `CONVENTIONS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `README.md`, `CHANGELOG.md`, `package.json`, `tsconfig.json`, `pyproject.toml`, `biome.json`, etc.) *and* by path substrings (`/knowledge/decisions/`, `/knowledge/concepts/`, `/knowledge/patterns/`, `/.pi/agent/skills/`, `/.pi/skills/`, `/rules/`). Add your own via config — see [Configuration](#configuration).
+
+**Command invalidation fires immediately, regardless of cutoff.** Built-in rules:
+
+- `git {add,rm,checkout,reset,stash,merge,rebase,cherry-pick}` invalidates earlier `git status`
+- `git {commit,merge,rebase}` invalidates earlier `git diff` / `git log`
+- `{npm,pnpm,yarn,bun} {install,add,remove}` invalidates earlier `{ls,list,outdated}`
+- `pip install` invalidates earlier `pip {list,freeze}`
+
+**v1.6.0 cwd-awareness:** invalidation now strips `cd <path> &&` prefix before matching, then scopes by cwd tuple. A commit in `/repoA` will NOT spuriously invalidate `git status` output that was actually run in `/repoB`. Single-cwd sessions behave identically to before (both cwds undefined → treated as same scope).
+
+**Add your own invalidation rules via config** (see [Configuration](#configuration)) — useful for stacked-diff tools like `gt` / `jj` / `spr` that aren't matched by built-in git rules.
 
 **Why masking over summarization** (per JetBrains Research Dec 2025 and Anthropic's own engineering guide):
 
 - Byte-identical placeholders produce a **single cache miss per tool-result lifetime**, then the cache stays warm. Summaries changed bytes every turn → repeated cache misses.
-- JetBrains empirical result: masking matches or beats LLM-style summarization on solve rate, -52% cost on Qwen3-Coder 480B
+- JetBrains empirical result: masking matches or beats LLM-style summarization on solve rate, -52% cost on Qwen3-Coder 480B.
 - Summaries cause "trajectory elongation" (+13-15% more turns) by smoothing over stop-signals. Masks don't.
-- The agent can re-read files or re-run commands if it needs the content again — just-in-time pattern endorsed by Anthropic. Masks preserve the command string or file path so the agent knows what to re-fetch.
+- The agent can re-read files or re-run commands if it needs the content again — just-in-time pattern endorsed by Anthropic. Masks preserve the command / file path so the agent knows what to re-fetch.
 
-**Measured result** on a 1074-message session that produced 0 compressions under the previous summarization algorithm: **301 masks applied, ~420KB saved, ~105K tokens freed**.
-
-Configure the window: `/compress-config window-size 10`
+**Measured result** on a 926-message real session at defaults: 42 cache variants, static cutoff yields ~$0.10 vs ≈$0.19 with no cache — ≈47% cost reduction, and prefix stays stable across full session length.
 
 ### Compound Command Handling
 
@@ -71,36 +80,145 @@ The `env`/`printenv` filter masks values for keys containing `KEY`, `SECRET`, `T
 
 ## Install
 
-Copy to your pi global extensions directory:
-
 ```bash
-git clone https://github.com/tomooshi/condensed-milk-pi.git
-cp -r condensed-milk-pi ~/.pi/agent/extensions/condensed-milk
+npm i -g @tomooshi/condensed-milk-pi
 ```
 
-Or symlink:
+Then reload pi (Ctrl+R) or restart.
 
-```bash
-git clone https://github.com/tomooshi/condensed-milk-pi.git ~/condensed-milk-pi
-ln -s ~/condensed-milk-pi ~/.pi/agent/extensions/condensed-milk
-```
-
-Then restart pi or run `/reload`.
+(Alternatively, clone-and-symlink: `git clone https://github.com/tomooshi/condensed-milk-pi.git ~/condensed-milk-pi && ln -s ~/condensed-milk-pi ~/.pi/agent/extensions/condensed-milk`.)
 
 ## Usage
 
-The extension works automatically — no configuration needed. Every bash command the model runs goes through the compression pipeline.
+The extension works automatically — no configuration needed. Every bash command the model runs goes through the compression pipeline, and retroactive masking activates on its own once context pressure crosses the first threshold.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
-| `/compress-stats` | Show compression statistics for the current session |
-| `/compress-config` | Show or update config (`window-size <N>`) |
+| `/compress-stats` | Show compression + masking statistics for the current session, including re-read telemetry (v1.4.0) |
+| `/compress-config` | Show or update thresholds/coverage (`thresholds 0.15,0.30,0.45`, `coverage 0.5,0.75,0.9`) |
 
 ### Status Bar
 
 Shows a running total: `↓12.5KB saved (15/42 cmds, 68%)`
+
+## Configuration
+
+Two config files, two different concerns, both optional.
+
+### 1. Cutoff behavior — `~/.config/condensed-milk.json`
+
+Controls when and how aggressively masking fires. Single source of truth for cache stability (no project-local overrides — intentional).
+
+```json
+{
+  "thresholds": [0.20, 0.35, 0.50],
+  "coverage":   [0.50, 0.75, 0.90]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `thresholds` | Context-usage fractions (0..1) that trigger cutoff advancement. Monotonically increasing. |
+| `coverage` | Fraction of messages masked when each threshold fires. Same length as `thresholds`. |
+
+Also editable via `/compress-config`. Changes take effect on next session.
+
+### 2. Rules — `~/.pi/agent/condensed-milk-config.json` (global) + `./condensed-milk.config.json` (project-local)
+
+Custom reference files and invalidation rules. Both files optional; when both exist they merge additively (project-local extends global).
+
+**Full schema with all fields:**
+
+```json
+{
+  "referenceBasenames": ["FILENAME.md", "spec.yaml"],
+  "referencePathSubstrings": ["/my-specs/", "/docs/adr/"],
+  "invalidationRules": [
+    {
+      "invalidator": "^cargo\\s+(build|update)\\b",
+      "invalidated": "^cargo\\s+(check|clippy)\\b"
+    }
+  ],
+  "disableDefaults": false
+}
+```
+
+| Field | Type | Purpose |
+|---|---|---|
+| `referenceBasenames` | `string[]` | File basenames (no path) that should never be masked. Matched against `path.split("/").pop()`. |
+| `referencePathSubstrings` | `string[]` | Any file whose path contains one of these substrings is protected. Good for "all files under this directory". |
+| `invalidationRules` | `{invalidator, invalidated}[]` | Each rule is a pair of regex source strings (NOT compiled `/regex/` literals — plain strings). When an `invalidator` command runs later, it invalidates earlier matching `invalidated` commands in the same cwd. |
+| `disableDefaults` | `boolean` | If `true`, your arrays *replace* the built-ins instead of extending them. Default `false`. |
+
+**Regex notes:**
+
+- Strings are passed to `new RegExp(...)`. Escape backslashes once: `"^git\\s+status"`, not `/^git\s+status/`.
+- Matching runs against the `cd`-stripped command. So your `invalidator` should match the bare tool invocation, not `cd /repo && tool ...`.
+- Invalidation only fires when both commands have the same cwd (both set to the same path, or both unset — the common single-cwd case).
+
+**Example 1 — add a custom spec-file protection:**
+
+Project uses OpenAPI specs under `./openapi/` that should stay inline all session.
+
+```json
+{
+  "referencePathSubstrings": ["/openapi/"]
+}
+```
+
+**Example 2 — add Graphite / stacked-diff invalidation:**
+
+Graphite's `gt submit`, `gt up`, `gt down` change git state but don't match built-in `^git` rules.
+
+```json
+{
+  "invalidationRules": [
+    { "invalidator": "^gt\\s+(up|down|submit|checkout|sync|restack)\\b", "invalidated": "^git\\s+(status|diff|log)\\b" },
+    { "invalidator": "^gt\\s+(create|modify|commit|absorb)\\b",          "invalidated": "^git\\s+(status|diff|log)\\b" }
+  ]
+}
+```
+
+**Example 3 — language-specific build invalidation:**
+
+```json
+{
+  "invalidationRules": [
+    { "invalidator": "^cargo\\s+(build|update|add|remove)\\b", "invalidated": "^cargo\\s+(check|clippy|test)\\b" },
+    { "invalidator": "^go\\s+(get|mod)\\b",                    "invalidated": "^go\\s+(build|test|vet)\\b" },
+    { "invalidator": "^zig\\s+build\\b",                       "invalidated": "^zig\\s+(test|run)\\b" }
+  ]
+}
+```
+
+**Example 4 — replace defaults entirely (advanced):**
+
+```json
+{
+  "disableDefaults": true,
+  "referenceBasenames": ["MY-AGENT.md"],
+  "referencePathSubstrings": ["/my-project/docs/"],
+  "invalidationRules": [
+    { "invalidator": "^mytool\\s+update\\b", "invalidated": "^mytool\\s+status\\b" }
+  ]
+}
+```
+
+**Failure modes (intentional fail-loud):**
+
+- File missing (ENOENT): silently skipped. Optional by design.
+- Permission denied / other IO error: throws at extension load — pi will surface the error.
+- Invalid JSON: throws with the file path in the error message. Fix the file or delete it.
+
+**Config precedence:**
+
+For a given setting, effective value = `defaults` ++ `global file` ++ `project-local file`, with `disableDefaults: true` anywhere removing the `defaults` tier. Arrays concatenate (don't de-duplicate — duplicates are cheap to iterate).
+
+**Cache-safety guarantee:**
+
+Expanding protection (adding referenceBasenames / referencePathSubstrings) only *reduces* the masked set; it never changes placeholder bytes for already-masked items. Adding invalidation rules can only *mask more* bash results, but masking is still deterministic per message — prefix stability holds. You cannot break cache economics via config.
 
 ## Architecture
 
