@@ -2,6 +2,47 @@
 
 All notable changes to condensed-milk.
 
+## [1.2.1] - 2026-04-16
+
+### Fixed — drift bug in v1.2.0 static-cutoff algorithm
+
+v1.2.0 recomputed `targetCutoff = floor(messages.length × coverage[zone])`
+every turn. When at zone 2 (>50% context) and messages keep appending,
+the cutoff crept forward by ~1 message per new message — effectively a
+rolling window at rate 0.9, not a static cutoff.
+
+Observed live: ~6 drift-write events per 275-turn session at zone 2,
+each costing ~$0.60 cache write.
+
+### Changed — true-static cutoff
+
+Cutoff now freezes at the moment a zone is first entered and does NOT
+re-derive from `messages.length` on subsequent turns. Exactly 3
+cache-write events per session (one per zone crossing) instead of
+drift-firing every ~10-15 turns.
+
+API addition: `decideCutoff(messagesLength, opts)` returns
+`{cutoffIdx, activeZone, zoneAdvanced}`. Caller persists `zoneEntered`
+and `cutoffIdx` across turns; filter is pure.
+
+### Measured (same 1114-turn session used to validate v1.2.0)
+
+| Algorithm | Variants | Total cost |
+|---|---|---|
+| Rolling N=10 (v1.1.1) | 340 | $1789 |
+| Static semi (v1.2.0) | 175 | $1545 |
+| **True-static (v1.2.1)** | 175 | $1549 |
+
+Cost delta vs v1.2.0 is within noise on multi-zone sessions. The win is
+predictability + correctness: the algorithm now behaves as the ADR-018
+thesis describes. Single-zone long sessions (typical zone-2 tails) will
+save drift writes not visible in the aggregate multi-zone number.
+
+### Migration
+
+Automatic. No config changes. Existing installs picking up v1.2.1 will
+transparently use the frozen-on-zone-entry behavior.
+
 ## [1.2.0] - 2026-04-16
 
 ### Fixed — cache-thrash bug in rolling-window masking (ADR-018)

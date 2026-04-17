@@ -269,8 +269,32 @@ function makeStaticCutoffFn(thresholds) {
 const staticA = runAlgo("Static cutoff (Option A, thresholds=[0.15, 0.25, 0.40])",
   makeStaticCutoffFn([0.15, 0.25, 0.40]));
 
-const staticB = runAlgo("Static cutoff (Option A, thresholds=[0.20, 0.35, 0.50])",
+const staticB = runAlgo("Static cutoff v1.2.0 semi-rolling (thresholds=[0.20, 0.35, 0.50])",
   makeStaticCutoffFn([0.20, 0.35, 0.50]));
+
+// v1.2.1 true-static: cutoff freezes at zone entry, does NOT re-derive
+// from messages.length on subsequent turns.
+function makeTrueStaticFn(thresholds) {
+  const coverage = [0.50, 0.75, 0.90];
+  let zoneEntered = -1;
+  let frozenCutoff = 0;
+  return (visible, ti) => {
+    const usage = ctxUsageAt(ti);
+    let zone = -1;
+    for (let z = thresholds.length - 1; z >= 0; z--) {
+      if (usage >= thresholds[z]) { zone = z; break; }
+    }
+    if (zone > zoneEntered) {
+      // Freeze cutoff at CURRENT length × coverage[zone]. Do NOT update later.
+      frozenCutoff = Math.max(frozenCutoff, Math.floor(visible.length * coverage[zone]));
+      zoneEntered = zone;
+    }
+    return maskStaticCutoff(visible, frozenCutoff);
+  };
+}
+
+const trueStatic = runAlgo("TRUE-STATIC v1.2.1 (frozen at zone entry, thresholds=[0.20, 0.35, 0.50])",
+  makeTrueStaticFn([0.20, 0.35, 0.50]));
 
 // No masking baseline
 const noMask = runAlgo("No retroactive masking (baseline)",
@@ -280,12 +304,14 @@ const noMask = runAlgo("No retroactive masking (baseline)",
 console.log(`\n${'='.repeat(70)}`);
 console.log("SUMMARY");
 console.log("="+'='.repeat(69));
+const rollingTotal = rolling.writeCost + rolling.readCost;
 const rows = [
   ["Algorithm", "Variants", "Write $", "Read $", "Total $", "vs rolling"],
-  ["No masking", noMask.variants, noMask.writeCost.toFixed(2), noMask.readCost.toFixed(2), (noMask.writeCost+noMask.readCost).toFixed(2), ((noMask.writeCost+noMask.readCost)/(rolling.writeCost+rolling.readCost)*100).toFixed(0)+"%"],
-  ["Rolling N=10 (current)", rolling.variants, rolling.writeCost.toFixed(2), rolling.readCost.toFixed(2), (rolling.writeCost+rolling.readCost).toFixed(2), "100%"],
-  ["Static [.15/.25/.40]", staticA.variants, staticA.writeCost.toFixed(2), staticA.readCost.toFixed(2), (staticA.writeCost+staticA.readCost).toFixed(2), ((staticA.writeCost+staticA.readCost)/(rolling.writeCost+rolling.readCost)*100).toFixed(0)+"%"],
-  ["Static [.20/.35/.50]", staticB.variants, staticB.writeCost.toFixed(2), staticB.readCost.toFixed(2), (staticB.writeCost+staticB.readCost).toFixed(2), ((staticB.writeCost+staticB.readCost)/(rolling.writeCost+rolling.readCost)*100).toFixed(0)+"%"],
+  ["No masking", noMask.variants, noMask.writeCost.toFixed(2), noMask.readCost.toFixed(2), (noMask.writeCost+noMask.readCost).toFixed(2), ((noMask.writeCost+noMask.readCost)/rollingTotal*100).toFixed(0)+"%"],
+  ["Rolling N=10 (v1.1.1)", rolling.variants, rolling.writeCost.toFixed(2), rolling.readCost.toFixed(2), rollingTotal.toFixed(2), "100%"],
+  ["Static semi [.15/.25/.40]", staticA.variants, staticA.writeCost.toFixed(2), staticA.readCost.toFixed(2), (staticA.writeCost+staticA.readCost).toFixed(2), ((staticA.writeCost+staticA.readCost)/rollingTotal*100).toFixed(0)+"%"],
+  ["Static semi [.20/.35/.50] v1.2.0", staticB.variants, staticB.writeCost.toFixed(2), staticB.readCost.toFixed(2), (staticB.writeCost+staticB.readCost).toFixed(2), ((staticB.writeCost+staticB.readCost)/rollingTotal*100).toFixed(0)+"%"],
+  ["TRUE-STATIC v1.2.1", trueStatic.variants, trueStatic.writeCost.toFixed(2), trueStatic.readCost.toFixed(2), (trueStatic.writeCost+trueStatic.readCost).toFixed(2), ((trueStatic.writeCost+trueStatic.readCost)/rollingTotal*100).toFixed(0)+"%"],
 ];
 for (const row of rows) {
   console.log(row.map((c, i) => String(c).padEnd(i === 0 ? 24 : 12)).join(""));

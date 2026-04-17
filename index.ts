@@ -32,7 +32,7 @@ import "./filters/build.js";
 import "./filters/test-runners.js";
 import "./filters/install.js";
 import { filterJsonOutput } from "./filters/json-schema.js";
-import { compressStaleToolResults } from "./filters/context-compress.js";
+import { compressStaleToolResults, decideCutoff } from "./filters/context-compress.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 
 // --- Config ---
@@ -124,6 +124,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     contextMaskEvents = 0;
     contextMasksTotal = 0;
     persistentCutoff = 0;
+    zoneEntered = -1;
     cacheHistory = [];
     totalCacheRead = 0;
     totalCacheWrite = 0;
@@ -188,6 +189,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let contextMaskEvents = 0;      // distinct context events that applied ≥1 mask
   let contextMasksTotal = 0;      // cumulative individual tool results masked
   let persistentCutoff = 0;       // ADR-018: T never regresses across turns
+  let zoneEntered = -1;           // v1.2.1: highest pressure zone ever entered; cutoff frozen on zone transition
 
   pi.on("context", async (event, ctx) => {
     turnCounter++;
@@ -226,14 +228,27 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       }
     } catch {}
 
-    // Apply static-cutoff masking. Cutoff advances only on pressure
-    // threshold crossings (ADR-018) — prevents per-turn mask frontier
-    // drift that caused the v1.1.x cache thrash.
+    // v1.2.1 true-static cutoff: cutoff freezes at zone entry and does
+    // NOT re-derive from messages.length on subsequent turns. Eliminates
+    // the drift-write pattern observed in v1.2.0 at zone 2.
+    const decision = decideCutoff(event.messages.length, {
+      thresholds: config.thresholds,
+      coverage: config.coverage,
+      contextUsage,
+      previousCutoff: persistentCutoff,
+      zoneEntered,
+    });
+    if (decision.zoneAdvanced) {
+      zoneEntered = decision.activeZone;
+      persistentCutoff = decision.cutoffIdx;
+    }
+
     const result = compressStaleToolResults(event.messages, {
       thresholds: config.thresholds,
       coverage: config.coverage,
       contextUsage,
       previousCutoff: persistentCutoff,
+      zoneEntered,
     });
     const turnBytesCompressed = result?.bytesSaved ?? 0;
     const turnMasksApplied = result?.masksApplied ?? 0;
@@ -242,7 +257,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       contextSaved += result.bytesSaved;
       contextMaskEvents++;
       contextMasksTotal += result.masksApplied;
-      persistentCutoff = result.cutoffIdx;
+      // persistentCutoff already updated on zone transition; nothing to do here
     }
 
     // Record this turn

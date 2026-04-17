@@ -74,6 +74,60 @@ export interface CompressOptions {
   contextUsage?: number;
   /** Previous cutoff idx. T never decreases. */
   previousCutoff?: number;
+  /** Highest zone ever entered this session. v1.2.1 true-static:
+   *  a zone enters EXACTLY once. After that, cutoff is frozen at the
+   *  messages.length-at-entry * coverage[zone]. Prevents drift when
+   *  messages.length keeps growing past a threshold. */
+  zoneEntered?: number;
+}
+
+export interface CutoffDecision {
+  /** Cutoff to use for this call. */
+  cutoffIdx: number;
+  /** Zone currently active (-1 if below all thresholds). */
+  activeZone: number;
+  /** True if this call caused a zone transition (caller should persist
+   *  the new zone + cutoff). */
+  zoneAdvanced: boolean;
+}
+
+/**
+ * Decide the cutoff for the current turn.
+ *
+ * v1.2.1: cutoff is frozen at first entry into a zone. Does NOT
+ * re-derive from current messages.length on subsequent turns within
+ * the same zone.
+ *
+ * @param messagesLength Current number of messages in the branch.
+ * @param opts previousCutoff + zoneEntered (persisted by caller).
+ */
+export function decideCutoff(
+  messagesLength: number,
+  opts: CompressOptions = {},
+): CutoffDecision {
+  const thresholds = opts.thresholds ?? DEFAULT_THRESHOLDS;
+  const coverage = opts.coverage ?? DEFAULT_COVERAGE;
+  const usage = opts.contextUsage ?? 0;
+  const previousCutoff = opts.previousCutoff ?? 0;
+  const zoneEntered = opts.zoneEntered ?? -1;
+
+  // Determine current pressure zone.
+  let activeZone = -1;
+  for (let z = thresholds.length - 1; z >= 0; z--) {
+    if (usage >= thresholds[z]) { activeZone = z; break; }
+  }
+
+  // True-static: only compute a new cutoff if we've entered a higher
+  // zone than previously seen. Otherwise keep previousCutoff exactly.
+  let cutoffIdx = previousCutoff;
+  let zoneAdvanced = false;
+  if (activeZone > zoneEntered) {
+    const newCutoff = Math.floor(messagesLength * coverage[activeZone]);
+    cutoffIdx = Math.max(previousCutoff, newCutoff);
+    zoneAdvanced = true;
+  }
+
+  return { cutoffIdx, activeZone, zoneAdvanced };
 }
 
 /**
@@ -84,23 +138,7 @@ export function compressStaleToolResults(
   messages: any[],
   opts: CompressOptions = {},
 ): CompressResult | null {
-  const thresholds = opts.thresholds ?? DEFAULT_THRESHOLDS;
-  const coverage = opts.coverage ?? DEFAULT_COVERAGE;
-  const usage = opts.contextUsage ?? 0;
-  const previousCutoff = opts.previousCutoff ?? 0;
-
-  // Determine target cutoff from current pressure zone.
-  // Zone = highest threshold currently exceeded; -1 if below first threshold.
-  let zone = -1;
-  for (let z = thresholds.length - 1; z >= 0; z--) {
-    if (usage >= thresholds[z]) { zone = z; break; }
-  }
-
-  const targetFraction = zone >= 0 ? coverage[zone] : 0;
-  const targetCutoff = Math.floor(messages.length * targetFraction);
-
-  // T never decreases — we can only advance further into history.
-  const cutoffIdx = Math.max(previousCutoff, targetCutoff);
+  const { cutoffIdx } = decideCutoff(messages.length, opts);
 
   if (cutoffIdx <= 0) return null;
 
