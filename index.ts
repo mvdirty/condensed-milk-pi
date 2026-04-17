@@ -127,7 +127,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     zoneEntered = -1;
     maskedReadPaths.clear();
     maskedBashCommands.clear();
-    reReadCount = 0;
+    everMaskedReads.clear();
+    everMaskedBashes.clear();
     reReadByRead = 0;
     reReadByBash = 0;
     reReadTurnsDeltaSum = 0;
@@ -142,17 +143,14 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, _ctx) => {
-    // v1.3.0 exp 3: re-read detection for read tool.
-    // If a path was previously masked and the model just re-read it,
-    // the mask was semantically lossy — record it.
+    // v1.4.0: re-read detection for read tool. Uses FIRST-mask turn.
     if (event.toolName === "read") {
       const path = (event.input as { path?: string })?.path;
       if (path && maskedReadPaths.has(path)) {
         const maskedTurn = maskedReadPaths.get(path)!;
-        reReadCount++;
         reReadByRead++;
         reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
-        maskedReadPaths.delete(path);  // consumed — the re-read replaces the stale mask
+        maskedReadPaths.delete(path);  // consumed; if re-masked later, set again as fresh first-mask
       }
       return;  // read output untouched by compressor filters
     }
@@ -162,10 +160,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     const command = (event.input as { command?: string })?.command;
     if (!command) return;
 
-    // v1.3.0 exp 3: re-read detection for bash.
+    // v1.4.0: re-read detection for bash. Uses FIRST-mask turn.
     if (maskedBashCommands.has(command)) {
       const maskedTurn = maskedBashCommands.get(command)!;
-      reReadCount++;
       reReadByBash++;
       reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
       maskedBashCommands.delete(command);
@@ -220,17 +217,19 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let persistentCutoff = 0;       // ADR-018: T never regresses across turns
   let zoneEntered = -1;           // v1.2.1: highest pressure zone ever entered; cutoff frozen on zone transition
 
-  // v1.3.0 exp 3: re-read telemetry.
-  // Map<path, turnMasked> for reads; Map<command, turnMasked> for bashes.
-  // On tool_result, if the same path/command appears, this is a re-read:
-  // the model discarded the placeholder and refetched. Records turn
-  // delta (turns between mask and re-read) to measure mask longevity.
+  // v1.4.0: re-read telemetry with first-mask-turn semantics.
+  // pi re-feeds original (unmasked) messages every context event, so we
+  // re-apply masks every turn. maskedReadPaths / maskedBashCommands record
+  // the FIRST turn we masked each path/command (only set if absent).
+  // When an item is re-read, we delete it from the tracker. Rate
+  // denominators use ever-masked sets which are never evicted.
   const maskedReadPaths = new Map<string, number>();
   const maskedBashCommands = new Map<string, number>();
-  let reReadCount = 0;
+  const everMaskedReads = new Set<string>();
+  const everMaskedBashes = new Set<string>();
   let reReadByRead = 0;
   let reReadByBash = 0;
-  let reReadTurnsDeltaSum = 0;  // sum of (currentTurn - turnMasked); mean = sum / reReadCount
+  let reReadTurnsDeltaSum = 0;  // sum of (currentTurn - firstMaskedTurn)
 
   pi.on("context", async (event, ctx) => {
     turnCounter++;
@@ -297,10 +296,23 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     if (result) {
       contextSaved += result.bytesSaved;
       contextMaskEvents++;
-      contextMasksTotal += result.masksApplied;
-      // v1.3.0 exp 3: record newly-masked items so we can detect later re-reads.
-      for (const p of result.maskedPaths) maskedReadPaths.set(p, turnCounter);
-      for (const c of result.maskedCommands) maskedBashCommands.set(c, turnCounter);
+      // v1.4.0: record each item only on its FIRST mask. pi re-feeds the
+      // raw messages each context event so the same items re-appear in
+      // result.maskedPaths/maskedCommands every turn — ignore repeats.
+      for (const p of result.maskedPaths) {
+        if (!everMaskedReads.has(p)) {
+          everMaskedReads.add(p);
+          contextMasksTotal++;
+        }
+        if (!maskedReadPaths.has(p)) maskedReadPaths.set(p, turnCounter);
+      }
+      for (const c of result.maskedCommands) {
+        if (!everMaskedBashes.has(c)) {
+          everMaskedBashes.add(c);
+          contextMasksTotal++;
+        }
+        if (!maskedBashCommands.has(c)) maskedBashCommands.set(c, turnCounter);
+      }
       // persistentCutoff already updated on zone transition; nothing to do here
     }
 
@@ -367,11 +379,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Bytes freed: ${formatBytes(contextSaved)} (~${formatTokens(Math.round(contextSaved / 4))})`,
         `  Current cutoff: msg #${persistentCutoff}`,
         "",
-        "Re-read Telemetry (v1.3.0 exp 3)",
-        `  Tracked masks: ${maskedReadPaths.size} reads, ${maskedBashCommands.size} bashes`,
-        `  Re-read events: ${reReadCount} (${reReadByRead} reads, ${reReadByBash} bashes)`,
-        `  Re-read rate: ${contextMasksTotal > 0 ? ((reReadCount / contextMasksTotal) * 100).toFixed(1) : "0.0"}% of masks refetched`,
-        `  Avg turns since mask: ${reReadCount > 0 ? (reReadTurnsDeltaSum / reReadCount).toFixed(1) : "—"}`,
+        "Re-read Telemetry (v1.4.0)",
+        `  Unique masks: ${everMaskedReads.size} reads, ${everMaskedBashes.size} bashes`,
+        `  Currently tracked: ${maskedReadPaths.size} reads, ${maskedBashCommands.size} bashes (evicted on re-read)`,
+        `  Re-read events: ${reReadByRead + reReadByBash} (${reReadByRead} reads, ${reReadByBash} bashes)`,
+        `  Re-read rate: reads ${everMaskedReads.size > 0 ? ((reReadByRead / everMaskedReads.size) * 100).toFixed(1) : "0.0"}% | bashes ${everMaskedBashes.size > 0 ? ((reReadByBash / everMaskedBashes.size) * 100).toFixed(1) : "0.0"}%`,
+        `  Avg turns placeholder held: ${(reReadByRead + reReadByBash) > 0 ? (reReadTurnsDeltaSum / (reReadByRead + reReadByBash)).toFixed(1) : "—"}`,
         "",
         "Cache Impact",
         `  Total input: ${formatTokens(totalAllInput)}`,

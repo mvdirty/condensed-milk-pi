@@ -2,6 +2,60 @@
 
 All notable changes to condensed-milk.
 
+## [1.4.0] - 2026-04-17
+
+### Fixed — re-read telemetry bugs exposed by real-session data
+
+Real v1.3.0 telemetry (100 turns, 30% context) showed two bugs:
+
+1. `turnsSinceMask` was always 0.0. pi re-feeds the raw (unmasked)
+   session history on every context event, so `compressStaleToolResults`
+   re-applies masks each turn. v1.3.0 used `Map.set()` unconditionally
+   on each re-application — the stored turn overwrote the first-mask
+   turn with the current turn.
+   **Fix:** only `.set()` the tracker when the key is absent. An item
+   is re-set as "fresh first-mask" only after it was consumed by a
+   re-read (`.delete()`).
+
+2. Re-read rate underreported by ~100x. v1.3.0 used
+   `reReadCount / contextMasksTotal` where the denominator was the
+   cumulative re-application count (re-applied ≈ N masks every turn).
+   **Fix:** introduced `everMaskedReads: Set<string>` and
+   `everMaskedBashes: Set<string>` as denominators. Rate is now split
+   per type: reads X.X% | bashes Y.Y%.
+
+3. `contextMasksTotal` similarly overcounted (every turn added all
+   under-cutoff items again). **Fix:** increment only on first-time
+   additions to the ever-masked sets.
+
+### Changed — read placeholder enriched
+
+v1.3.0 real-session data showed reads had 33% re-read rate (3/9)
+while bashes had 0% (0/52) — the read placeholder `[masked read] /path`
+was semantically lossy. The command name in `[masked bash] <cmd>` was
+sufficient because the command itself signals freshness.
+
+**New read placeholder:** `[masked read] /path (N lines, SIZE)` where
+N is the line count and SIZE is the original content size (e.g. `2.4KB`).
+Derived purely from the original content → byte-deterministic per
+message → cache prefix stays stable. Verified on real JSONLs: variants
+count unchanged (42→42, 6→6 on two sessions); $ delta <0.005%.
+
+**Bash placeholder unchanged.**
+
+### Changed — /compress-stats output
+
+```
+Re-read Telemetry (v1.4.0)
+  Unique masks: R reads, B bashes
+  Currently tracked: R reads, B bashes (evicted on re-read)
+  Re-read events: K (R reads, B bashes)
+  Re-read rate: reads X.X% | bashes Y.Y%
+  Avg turns placeholder held: Z.Z
+```
+
+ADR-022 (`knowledge/decisions/022-v1-4-0-telemetry-fixes-and-read-placeholder-enrich.md`).
+
 ## [1.3.0] - 2026-04-17
 
 ### Added — re-read telemetry (instrumentation only, no behavior change)

@@ -73,7 +73,12 @@ function maybeMask(m, toolCallIdx) {
     const p = extractPath(msg, toolCallIdx);
     const c = textContent(msg);
     if (p && c.length >= MIN_MASK_LENGTH && !isReferenceFile(p)) {
-      return replaceContent(m, `[masked read] ${p}`);
+      // v1.4.0 enriched placeholder — deterministic per message.
+      let lines = 0; if (c.length > 0) { lines = 1; for (let i = 0; i < c.length; i++) if (c.charCodeAt(i) === 10) lines++; }
+      const size = c.length < 1024 ? `${c.length}B`
+                : c.length < 1048576 ? `${(c.length/1024).toFixed(1)}KB`
+                : `${(c.length/1048576).toFixed(1)}MB`;
+      return replaceContent(m, `[masked read] ${p} (${lines} lines, ${size})`);
     }
   }
   return null;

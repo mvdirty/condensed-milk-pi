@@ -105,4 +105,38 @@ for (const p of result.maskedPaths) {
   if (!/^\/file\/\d+\.py$/.test(p)) { console.error("FAIL: bad path", p); process.exit(1); }
 }
 
-console.log("\nPASS — CompressResult exposes maskedPaths + maskedCommands correctly.");
+// v1.4.0: verify enriched read placeholder format.
+const maskedMsgs = result.messages.slice(0, result.cutoffIdx);
+let readPlaceholdersChecked = 0;
+for (const m of maskedMsgs) {
+  const msg = m?.message ?? m;
+  if (msg?.role !== "toolResult" || msg?.toolName !== "read") continue;
+  const text = msg.content?.[0]?.text ?? "";
+  if (!text.startsWith("[masked read]")) continue;
+  // Expected: "[masked read] /file/N.py (L lines, SIZE)"
+  const match = /^\[masked read\] (\S+) \((\d+) lines, ([\d.]+(?:B|KB|MB))\)$/.exec(text);
+  if (!match) { console.error("FAIL: read placeholder format", text); process.exit(1); }
+  readPlaceholdersChecked++;
+}
+if (readPlaceholdersChecked === 0) { console.error("FAIL: no read placeholders checked"); process.exit(1); }
+console.log(`Read placeholders validated: ${readPlaceholdersChecked}`);
+
+// v1.4.0: determinism — same input → same placeholder (cache-safety invariant).
+const r2 = compressStaleToolResults(messages, {
+  thresholds: [0.20, 0.35, 0.50],
+  coverage: [0.50, 0.75, 0.90],
+  contextUsage: 0.25,
+  previousCutoff: 0,
+  zoneEntered: -1,
+});
+const firstPlaceholders = result.messages.slice(0, result.cutoffIdx)
+  .map(m => (m?.message?.content ?? m?.content)?.[0]?.text ?? "");
+const secondPlaceholders = r2.messages.slice(0, r2.cutoffIdx)
+  .map(m => (m?.message?.content ?? m?.content)?.[0]?.text ?? "");
+if (firstPlaceholders.join("|") !== secondPlaceholders.join("|")) {
+  console.error("FAIL: placeholders are not deterministic — cache-safety broken");
+  process.exit(1);
+}
+console.log("Determinism: OK (same input produces byte-identical placeholders)");
+
+console.log("\nPASS — v1.4.0 enriched read placeholder + determinism.");

@@ -56,6 +56,21 @@ function isReferenceFile(path: string): boolean {
   return REFERENCE_FILES.has(path.split("/").pop() ?? path);
 }
 
+/** Count newlines + 1 (matches `wc -l` + 1 semantics for non-trailing-newline files). */
+function countLines(s: string): number {
+  if (s.length === 0) return 0;
+  let n = 1;
+  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
+  return n;
+}
+
+/** Deterministic size string — must not depend on locale or time. */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
 export interface CompressResult {
   messages: any[];
   bytesSaved: number;
@@ -185,7 +200,13 @@ export function compressStaleToolResults(
       const content = extractTextContent(msg);
 
       if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < cutoffIdx) {
-        const placeholder = `[masked read] ${path}`;
+        // v1.4.0: enrich read placeholder with deterministic size/line
+        // metadata so the model can decide whether to re-read without
+        // actually re-reading. Derived purely from the original content
+        // → byte-identical per message → cache prefix stays stable.
+        const lineCount = countLines(content);
+        const sizeStr = formatSize(content.length);
+        const placeholder = `[masked read] ${path} (${lineCount} lines, ${sizeStr})`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
         maskedPaths.push(path);
