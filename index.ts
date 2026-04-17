@@ -36,15 +36,23 @@ import { compressStaleToolResults } from "./filters/context-compress.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 
 // --- Config ---
-// v1.1.0: cacheAware gate removed (was broken AND unnecessary under
-// masking — deterministic placeholders self-stabilize cache). Only
-// tunable is rolling window size.
+// v1.2.0 (ADR-018): static-cutoff algorithm replaces rolling window.
+// Cutoff advances only on pressure threshold crossings — bytes before
+// the cutoff stay identical turn-over-turn — cache prefix stable.
+//
+// Migration from v1.1.x: windowSize silently ignored.
 interface CompressorConfig {
-  windowSize: number;  // Messages-from-HEAD kept unmasked. JetBrains default: 10.
+  /** Context-usage thresholds (monotonically increasing, 0..1) that
+   *  trigger cutoff advancement. Default [0.20, 0.35, 0.50]. */
+  thresholds: number[];
+  /** Coverage fractions at each threshold — fraction of messages to
+   *  mask when that threshold fires. Must match thresholds length. */
+  coverage: number[];
 }
 
 const DEFAULT_CONFIG: CompressorConfig = {
-  windowSize: 10,
+  thresholds: [0.20, 0.35, 0.50],
+  coverage:   [0.50, 0.75, 0.90],
 };
 
 const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
@@ -53,13 +61,16 @@ function loadConfig(): CompressorConfig {
   try {
     const raw = readFileSync(CONFIG_PATH, "utf-8");
     const parsed = JSON.parse(raw);
-    return {
-      windowSize: typeof parsed.windowSize === "number" && parsed.windowSize > 0
-        ? parsed.windowSize
-        : DEFAULT_CONFIG.windowSize,
-    };
+    const isValidArr = (v: unknown, len?: number) =>
+      Array.isArray(v) && v.every((x) => typeof x === "number" && x >= 0 && x <= 1) &&
+      (len === undefined || v.length === len);
+    const thresholds = isValidArr(parsed.thresholds) ? parsed.thresholds : DEFAULT_CONFIG.thresholds;
+    const coverage = isValidArr(parsed.coverage, thresholds.length)
+      ? parsed.coverage
+      : DEFAULT_CONFIG.coverage;
+    return { thresholds, coverage };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { thresholds: [...DEFAULT_CONFIG.thresholds], coverage: [...DEFAULT_CONFIG.coverage] };
   }
 }
 
@@ -112,6 +123,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     contextSaved = 0;
     contextMaskEvents = 0;
     contextMasksTotal = 0;
+    persistentCutoff = 0;
     cacheHistory = [];
     totalCacheRead = 0;
     totalCacheWrite = 0;
@@ -175,8 +187,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let contextSaved = 0;          // cumulative bytes freed by masking across session
   let contextMaskEvents = 0;      // distinct context events that applied ≥1 mask
   let contextMasksTotal = 0;      // cumulative individual tool results masked
+  let persistentCutoff = 0;       // ADR-018: T never regresses across turns
 
-  pi.on("context", async (event, _ctx) => {
+  pi.on("context", async (event, ctx) => {
     turnCounter++;
 
     // Recalculate cumulative cache stats from all assistant messages.
@@ -204,9 +217,24 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       }
     }
 
-    // Apply masking. Returns null if nothing to mask, else { messages,
-    // bytesSaved, masksApplied } — analytical stats, no JSON.stringify.
-    const result = compressStaleToolResults(event.messages, config.windowSize);
+    // Read current context usage to drive static-cutoff decision.
+    let contextUsage = 0;
+    try {
+      const usage = (ctx as any).getContextUsage?.();
+      if (usage?.tokens && usage?.contextWindow) {
+        contextUsage = usage.tokens / usage.contextWindow;
+      }
+    } catch {}
+
+    // Apply static-cutoff masking. Cutoff advances only on pressure
+    // threshold crossings (ADR-018) — prevents per-turn mask frontier
+    // drift that caused the v1.1.x cache thrash.
+    const result = compressStaleToolResults(event.messages, {
+      thresholds: config.thresholds,
+      coverage: config.coverage,
+      contextUsage,
+      previousCutoff: persistentCutoff,
+    });
     const turnBytesCompressed = result?.bytesSaved ?? 0;
     const turnMasksApplied = result?.masksApplied ?? 0;
 
@@ -214,6 +242,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       contextSaved += result.bytesSaved;
       contextMaskEvents++;
       contextMasksTotal += result.masksApplied;
+      persistentCutoff = result.cutoffIdx;
     }
 
     // Record this turn
@@ -274,9 +303,10 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Compressed: ${formatBytes(totalCompressed)}`,
         `  Saved: ${formatBytes(totalSaved)} (${pct}%)`,
         "",
-        "Retroactive Masking (v1.1.0)",
+        "Retroactive Masking (v1.2.0: static cutoff)",
         `  Tool results masked: ${contextMasksTotal} across ${contextMaskEvents} events`,
         `  Bytes freed: ${formatBytes(contextSaved)} (~${formatTokens(Math.round(contextSaved / 4))})`,
+        `  Current cutoff: msg #${persistentCutoff}`,
         "",
         "Cache Impact",
         `  Total input: ${formatTokens(totalAllInput)}`,
@@ -289,7 +319,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         "",
         "Tradeoff",
         `  Turns tracked: ${cacheHistory.length}`,
-        `  Rolling window: ${config.windowSize} messages (older tool results get masked)`,
+        `  Thresholds: [${config.thresholds.join(", ")}]  coverage: [${config.coverage.join(", ")}]`,
+        `  (cutoff advances only when context crosses a threshold — cache-stable)`,
       ];
 
       // Show last 5 turns cache data
@@ -318,43 +349,69 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
   // /compress-config command
   pi.registerCommand("compress-config", {
-    description: "Configure token compressor (window-size <N>)",
+    description: "Configure token compressor (thresholds, coverage)",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/);
       const key = parts[0]?.toLowerCase();
-      const value = parts[1];
+      const value = parts.slice(1).join(" ");
 
       if (!key) {
         ctx.ui?.notify?.(
           [
-            "Compressor Config",
-            `  window-size: ${config.windowSize}`,
+            "Compressor Config (v1.2.0: static-cutoff masking)",
+            `  thresholds: [${config.thresholds.join(", ")}]`,
+            `  coverage:   [${config.coverage.join(", ")}]`,
             "",
             "Usage:",
-            "  /compress-config window-size 10   # messages-from-HEAD kept unmasked (default: 10)",
+            "  /compress-config thresholds 0.20,0.35,0.50   # context-% triggers (monotonic)",
+            "  /compress-config coverage 0.50,0.75,0.90     # mask fraction per trigger",
             "",
-            "Masking (v1.1.0): deterministic [masked <tool>] placeholders.",
-            "Older tool results outside the window get replaced with a",
-            "byte-stable placeholder. Cache-safe by design.",
+            "How it works: cutoff T advances only when context usage crosses a",
+            "threshold. Bytes before T stay byte-identical turn-over-turn —",
+            "cache prefix stays stable. Deterministic placeholders, no thrash.",
           ].join("\n"),
           "info",
         );
         return;
       }
 
-      if (key === "window-size") {
-        const n = Number.parseInt(value ?? "", 10);
-        if (Number.isNaN(n) || n < 1) {
-          ctx.ui?.notify?.("Usage: /compress-config window-size <positive integer>", "warning");
+      if (key === "thresholds" || key === "coverage") {
+        const arr = value.split(/[\s,]+/).filter(Boolean).map(Number);
+        if (arr.length === 0 || arr.some((n) => !Number.isFinite(n) || n < 0 || n > 1)) {
+          ctx.ui?.notify?.(`Usage: /compress-config ${key} 0.20,0.35,0.50  (values in [0,1])`, "warning");
           return;
         }
-        config.windowSize = n;
+        // Check monotonic
+        for (let i = 1; i < arr.length; i++) {
+          if (arr[i] <= arr[i - 1]) {
+            ctx.ui?.notify?.(`${key} must be strictly increasing`, "warning");
+            return;
+          }
+        }
+        if (key === "thresholds") {
+          config.thresholds = arr;
+          if (config.coverage.length !== arr.length) {
+            ctx.ui?.notify?.(
+              `thresholds set to [${arr.join(", ")}]. Now also set coverage with the same length.`,
+              "warning",
+            );
+          }
+        } else {
+          if (arr.length !== config.thresholds.length) {
+            ctx.ui?.notify?.(
+              `coverage length (${arr.length}) must match thresholds length (${config.thresholds.length})`,
+              "warning",
+            );
+            return;
+          }
+          config.coverage = arr;
+        }
         saveConfig(config);
-        ctx.ui?.notify?.(`Rolling window set to ${n} messages`, "info");
+        ctx.ui?.notify?.(`${key} set to [${arr.join(", ")}]`, "info");
         return;
       }
 
-      ctx.ui?.notify?.(`Unknown config key: ${key}. Use window-size.`, "warning");
+      ctx.ui?.notify?.(`Unknown config key: ${key}. Use thresholds or coverage.`, "warning");
     },
   });
 }

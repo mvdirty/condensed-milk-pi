@@ -2,6 +2,64 @@
 
 All notable changes to condensed-milk.
 
+## [1.2.0] - 2026-04-16
+
+### Fixed — cache-thrash bug in rolling-window masking (ADR-018)
+
+The rolling-window algorithm introduced in v1.1.0 was measured to be
+**actively harmful**: it produced 2x more distinct cache prefix variants
+than no masking at all, costing 11% MORE than doing nothing.
+
+Root cause: mask frontier at `messages.length - windowSize` shifts by 1
+every turn a new tool result appends. Anything hashed up through BP2
+(last-user-message cache breakpoint) that included that position must
+be re-cached. Classic frontier-drift thrash.
+
+### Changed — static-cutoff algorithm replaces rolling window
+
+The cutoff T advances only when context usage crosses a pressure
+threshold. Between advances, T is immutable — bytes before T stay
+byte-identical turn-over-turn — cache prefix stays stable.
+
+- Default thresholds: `[0.20, 0.35, 0.50]` of context window usage
+- Default coverage:   `[0.50, 0.75, 0.90]` fraction of messages masked
+
+T monotonically advances. Once a message is masked, it stays masked.
+
+### Measured on a real 1114-turn session JSONL (test-replay.mjs)
+
+| Algorithm | Cache variants | Write cost | Read cost | Total |
+|---|---|---|---|---|
+| No retroactive masking | 157 | $1386 | $28 | **$1414** |
+| Rolling window N=10 (v1.1.1) | 316 | $1564 | $30 | **$1594** |
+| Static cutoff (v1.2.0) | 159 | $1320 | $26 | **$1346** |
+
+Static cutoff saves **16% vs rolling window** and **5% vs no masking**.
+
+### Config changes
+
+- `windowSize` replaced by `thresholds` + `coverage` arrays
+- Old config files with `windowSize` silently ignored, defaults applied
+- `/compress-config thresholds 0.20,0.35,0.50`
+- `/compress-config coverage   0.50,0.75,0.90`
+
+### Validation
+
+- test-replay.mjs: offline harness that replays any pi session JSONL
+  through both algorithms and reports cache-variant counts + cost.
+- Proves directionally correct; live A/B should follow.
+
+### Migration
+
+Automatic. Existing `~/.config/condensed-milk.json` with
+`{windowSize: 10}` will be silently overwritten with new defaults on
+next config save. No user action needed.
+
+### References
+
+- ADR-018 (mojo-template-pi vault) — supersedes parts of ADR-016
+- Measurement: `test-replay.mjs` committed to repo
+
 ## [1.1.1] - 2026-04-16
 
 ### Fixed

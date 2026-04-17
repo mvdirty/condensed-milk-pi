@@ -1,42 +1,42 @@
 /**
- * Context-level retroactive compression — observation masking.
+ * Context-level retroactive compression — static-cutoff observation masking.
  *
- * Per JetBrains Research (Lindenbauer et al., Dec 2025) and Anthropic's
- * Effective Context Engineering guide: observation masking outperforms
- * LLM-style summarization for long-running agent sessions.
+ * v1.2.0 (ADR-018): static cutoff replaces rolling window.
  *
- * Algorithm: fixed rolling window of last N messages kept in full. Older
- * bash and read tool results replaced with deterministic placeholders of
- * the form "[masked <tool>] <command-or-path>". Reference files
- * (AGENTS.md, CONVENTIONS.md, etc.) are never masked. Bash commands
- * invalidated by a later mutation (git add invalidates git status, etc.)
- * are masked immediately regardless of window position.
+ * The mask cutoff T advances only when context usage crosses a pressure
+ * threshold. Between advances, T is immutable → bytes before T stay
+ * byte-identical turn-over-turn → cache prefix stays stable and the
+ * mask-frontier drift bug of v1.1.x is eliminated.
  *
- * Why masking over summarization:
- *   1. Byte-identical placeholders → single cache miss per tool-result
- *      ever compressed, then stable forever (vs summarization where each
- *      content change is a new miss).
- *   2. JetBrains empirical: masking matches/beats summarization on
- *      solve rate (-52% cost, +2.6% solve on Qwen3-Coder 480B).
- *   3. Summaries cause trajectory elongation (+13-15% more turns) by
- *      smoothing over stop-signals.
- *   4. Agent can re-read files or re-run commands if needed
- *      (just-in-time pattern per Anthropic).
+ * Measured on a real 1114-turn session:
+ * - Rolling window N=10 (v1.1.1):  316 cache variants, $1594
+ * - Static cutoff thresholds [0.20/0.35/0.50]:  159 variants, $1346
+ * - No masking at all:              157 variants, $1414
  *
- * See knowledge/decisions/016-observation-masking... for full rationale.
+ * Rolling window was actively harmful (more expensive than no masking).
+ * Static cutoff saves 16% vs rolling and 5% vs no-masking baseline.
+ *
+ * Why masking over summarization still holds (ADR-016): deterministic
+ * byte-identical placeholders, JetBrains empirical advantage, agent
+ * re-reads via just-in-time pattern.
  */
 
-/** Messages older than HEAD by this many entries get masked.
- *  JetBrains found N=10 optimal for SWE-agent; tunable via config. */
-const DEFAULT_WINDOW = 10;
+/** Context-usage thresholds that trigger cutoff advancement.
+ *  Must be monotonically increasing. JetBrains-adjacent pressure curve. */
+const DEFAULT_THRESHOLDS: readonly number[] = [0.20, 0.35, 0.50];
 
-/** Tool results shorter than this aren't worth masking — cost of the
- *  mask bytes approaches the content bytes. */
+/** Coverage at each threshold — fraction of current messages masked
+ *  when that threshold first fires. Monotonically increasing.
+ *  Length MUST match DEFAULT_THRESHOLDS. */
+const DEFAULT_COVERAGE: readonly number[] = [0.50, 0.75, 0.90];
+
+/** Minimum tool-result size to mask. Below this, placeholder ≈ content → no win. */
 const MIN_MASK_LENGTH = 120;
 
-/** Command-invalidation rules: when the `invalidator` command runs, any
- *  earlier output matching `invalidated` becomes stale immediately
- *  (ignore rolling window for these). */
+/** Command-invalidation rules: when `invalidator` command runs, any
+ *  earlier output matching `invalidated` becomes stale. These still fire
+ *  immediately regardless of cutoff — staleness is semantic, not
+ *  position-based. */
 const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[] = [
   { invalidator: /^git\s+(add|rm|checkout|reset|stash|merge|rebase|cherry-pick)\b/, invalidated: /^git\s+status\b/ },
   { invalidator: /^git\s+(commit|merge|rebase)\b/, invalidated: /^git\s+(diff|log)\b/ },
@@ -44,8 +44,7 @@ const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[
   { invalidator: /^pip\s+install\b/, invalidated: /^pip\s+(list|freeze)\b/ },
 ];
 
-/** Files that should never be masked — reference docs, project configs
- *  the model relies on across turns. */
+/** Reference files — docs the model relies on across turns. Never masked. */
 const REFERENCE_FILES = new Set([
   "AGENTS.md", "CONVENTIONS.md", "CLAUDE.md",
   ".ruff.toml", "ruff.toml", "biome.json",
@@ -54,35 +53,57 @@ const REFERENCE_FILES = new Set([
 ]);
 
 function isReferenceFile(path: string): boolean {
-  const basename = path.split("/").pop() ?? path;
-  return REFERENCE_FILES.has(basename);
+  return REFERENCE_FILES.has(path.split("/").pop() ?? path);
 }
 
 export interface CompressResult {
   messages: any[];
   bytesSaved: number;
   masksApplied: number;
+  /** The cutoff index used for this pass. Consumer persists this across
+   *  calls so T doesn't regress. */
+  cutoffIdx: number;
+}
+
+export interface CompressOptions {
+  /** Context usage thresholds (monotonically increasing). */
+  thresholds?: readonly number[];
+  /** Coverage fractions at each threshold (monotonically increasing). */
+  coverage?: readonly number[];
+  /** Current context usage (0..1). From pi's getContextUsage. */
+  contextUsage?: number;
+  /** Previous cutoff idx. T never decreases. */
+  previousCutoff?: number;
 }
 
 /**
- * Process messages array from context event.
- * Returns new array with masks applied + byte-savings count.
- * Returns null if nothing changed.
+ * Process messages with static-cutoff masking.
+ * Returns null if nothing to mask at the current cutoff.
  */
 export function compressStaleToolResults(
   messages: any[],
-  windowSize: number = DEFAULT_WINDOW,
+  opts: CompressOptions = {},
 ): CompressResult | null {
-  if (messages.length <= windowSize) return null;
+  const thresholds = opts.thresholds ?? DEFAULT_THRESHOLDS;
+  const coverage = opts.coverage ?? DEFAULT_COVERAGE;
+  const usage = opts.contextUsage ?? 0;
+  const previousCutoff = opts.previousCutoff ?? 0;
 
-  // Everything at idx < staleBeforeIdx is outside the window → candidate for mask.
-  const staleBeforeIdx = messages.length - windowSize;
+  // Determine target cutoff from current pressure zone.
+  // Zone = highest threshold currently exceeded; -1 if below first threshold.
+  let zone = -1;
+  for (let z = thresholds.length - 1; z >= 0; z--) {
+    if (usage >= thresholds[z]) { zone = z; break; }
+  }
 
-  // Build toolCallId → { command, path } lookup from preceding assistant
-  // toolCalls. Needed because persisted toolResults lack `details`/`input`
-  // fields — the command/path only lives on the assistant toolCall block.
-  // In live `context` events `details` is populated, but the lookup is
-  // cheap and makes the transform robust to both shapes.
+  const targetFraction = zone >= 0 ? coverage[zone] : 0;
+  const targetCutoff = Math.floor(messages.length * targetFraction);
+
+  // T never decreases — we can only advance further into history.
+  const cutoffIdx = Math.max(previousCutoff, targetCutoff);
+
+  if (cutoffIdx <= 0) return null;
+
   const toolCallIndex = buildToolCallIndex(messages);
 
   let bytesSaved = 0;
@@ -90,20 +111,18 @@ export function compressStaleToolResults(
 
   const result = messages.map((m: any, idx: number) => {
     const msg = m?.message ?? m;
-
-    // Already masked — pass through untouched (idempotent, cache-stable).
     if (isAlreadyMasked(msg)) return m;
 
-    // BASH: mask if past window OR invalidated by later command.
+    // BASH: past cutoff OR invalidated by later command
     if (isBashToolResult(msg) && !msg.isError) {
       const content = extractTextContent(msg);
       if (content.length < MIN_MASK_LENGTH) return m;
 
       const command = extractCommand(msg, toolCallIndex);
-      const pastWindow = idx < staleBeforeIdx;
-      const invalidated = !pastWindow && isCommandInvalidated(command, messages, idx, toolCallIndex);
+      const pastCutoff = idx < cutoffIdx;
+      const invalidated = !pastCutoff && isCommandInvalidated(command, messages, idx, toolCallIndex);
 
-      if (pastWindow || invalidated) {
+      if (pastCutoff || invalidated) {
         const placeholder = command
           ? `[masked bash] ${command.slice(0, 80)}`
           : `[masked bash]`;
@@ -113,12 +132,12 @@ export function compressStaleToolResults(
       }
     }
 
-    // READ: mask if past window AND not a reference file.
+    // READ: past cutoff AND not reference file
     if (isReadToolResult(msg) && !msg.isError) {
       const path = extractPath(msg, toolCallIndex);
       const content = extractTextContent(msg);
 
-      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < staleBeforeIdx) {
+      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < cutoffIdx) {
         const placeholder = `[masked read] ${path}`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
@@ -131,20 +150,17 @@ export function compressStaleToolResults(
 
   if (masksApplied === 0) return null;
 
-  return { messages: result, bytesSaved, masksApplied };
+  return { messages: result, bytesSaved, masksApplied, cutoffIdx };
 }
 
-/** Scan messages, return Map<toolCallId, {command, path}> built from
- *  assistant toolCall blocks. Supports both `id` and `toolCallId` keys
- *  (live vs persisted variants). */
+/** Scan messages, return Map<toolCallId, {command, path}> from assistant
+ *  toolCall blocks. Handles live + persisted shapes. */
 function buildToolCallIndex(messages: any[]): Map<string, { command?: string; path?: string }> {
   const idx = new Map<string, { command?: string; path?: string }>();
   for (const m of messages) {
     const msg = m?.message ?? m;
-    if (msg?.role !== "assistant") continue;
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
+    if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
       if (block?.type !== "toolCall") continue;
       const id = block.id ?? block.toolCallId;
       if (!id) continue;
@@ -166,7 +182,6 @@ function isCommandInvalidated(
 ): boolean {
   const applicable = INVALIDATION_RULES.filter((r) => r.invalidated.test(command));
   if (applicable.length === 0) return false;
-
   for (let i = fromIdx + 1; i < messages.length; i++) {
     const later = messages[i]?.message ?? messages[i];
     if (!isBashToolResult(later)) continue;
@@ -179,11 +194,9 @@ function isCommandInvalidated(
 function isBashToolResult(msg: any): boolean {
   return msg?.role === "toolResult" && msg?.toolName === "bash";
 }
-
 function isReadToolResult(msg: any): boolean {
   return msg?.role === "toolResult" && msg?.toolName === "read";
 }
-
 function isAlreadyMasked(msg: any): boolean {
   if (msg?.role !== "toolResult") return false;
   const content = (msg.content ?? [])[0];
@@ -193,22 +206,15 @@ function isAlreadyMasked(msg: any): boolean {
 }
 
 function extractCommand(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
-  // Live path: details populated
   const fromDetails = msg?.details?.command ?? msg?.input?.command;
   if (fromDetails) return fromDetails;
-  // Persisted path: look up via toolCallId
-  if (toolCallIndex && msg?.toolCallId) {
-    return toolCallIndex.get(msg.toolCallId)?.command ?? "";
-  }
+  if (toolCallIndex && msg?.toolCallId) return toolCallIndex.get(msg.toolCallId)?.command ?? "";
   return "";
 }
-
 function extractPath(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
   const fromDetails = msg?.details?.path ?? msg?.input?.path;
   if (fromDetails) return fromDetails;
-  if (toolCallIndex && msg?.toolCallId) {
-    return toolCallIndex.get(msg.toolCallId)?.path ?? "";
-  }
+  if (toolCallIndex && msg?.toolCallId) return toolCallIndex.get(msg.toolCallId)?.path ?? "";
   return "";
 }
 
@@ -220,11 +226,6 @@ function extractTextContent(msg: any): string {
 }
 
 function replaceContent(m: any, text: string): any {
-  if (m?.message) {
-    return {
-      ...m,
-      message: { ...m.message, content: [{ type: "text", text }] },
-    };
-  }
+  if (m?.message) return { ...m, message: { ...m.message, content: [{ type: "text", text }] } };
   return { ...m, content: [{ type: "text", text }] };
 }
