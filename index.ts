@@ -9,9 +9,10 @@
  * Filters are registered by individual modules at import time.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { dispatch, registeredCommands, registerContentFallback } from "./filters/dispatch.js";
 
 // Import filter modules — each self-registers via registerFilter()
@@ -65,7 +66,70 @@ const DEFAULT_CONFIG: CompressorConfig = {
   coverage:   [0.60, 0.80, 0.95],
 };
 
+// v1.7.1 (ADR-026): recognized prior-version default tuples.
+// If a user's config exactly matches one of these, they never customized
+// and are just carrying stale auto-persisted defaults from an older version.
+// Auto-migrate such configs to current DEFAULT_CONFIG. Any config not in this
+// list is treated as an explicit user customization and preserved as-is.
+const STALE_DEFAULTS: ReadonlyArray<{ label: string; thresholds: number[]; coverage: number[] }> = [
+  { label: "v1.6.x", thresholds: [0.20, 0.35, 0.50], coverage: [0.50, 0.75, 0.90] },
+];
+
 const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
+
+// v1.8.0: opt-in local telemetry. Never default on. See ADR-027.
+// Path is separate from CONFIG_PATH so deleting one doesn't disturb the other.
+const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
+const TELEMETRY_SCHEMA_VERSION = 1;
+const PACKAGE_VERSION = "1.8.0";
+
+interface TelemetryConfig {
+  local: boolean;
+}
+
+const DEFAULT_TELEMETRY: TelemetryConfig = { local: false };
+
+/** Read telemetry flag with env-var override. Env var takes precedence over
+ *  config file so users can toggle without editing config. Missing config or
+ *  env var means disabled — opt-in only, never default on. */
+function loadTelemetryConfig(): TelemetryConfig {
+  const env = process.env.CONDENSED_MILK_TELEMETRY;
+  if (env === "on" || env === "1" || env === "true") return { local: true };
+  if (env === "off" || env === "0" || env === "false") return { local: false };
+  try {
+    const raw = readFileSync(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.telemetry && typeof parsed.telemetry.local === "boolean") {
+      return { local: parsed.telemetry.local };
+    }
+  } catch { /* file absent or invalid → default off */ }
+  return { ...DEFAULT_TELEMETRY };
+}
+
+function saveTelemetryConfig(cfg: TelemetryConfig): void {
+  try {
+    let existing: Record<string, unknown> = {};
+    try { existing = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")); } catch { /* fresh */ }
+    existing.telemetry = { local: cfg.local };
+    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2) + "\n");
+  } catch { /* best-effort persist */ }
+}
+
+function arrEqual(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function matchesStaleDefault(cfg: CompressorConfig): string | null {
+  for (const s of STALE_DEFAULTS) {
+    if (arrEqual(cfg.thresholds, s.thresholds) && arrEqual(cfg.coverage, s.coverage)) {
+      return s.label;
+    }
+  }
+  return null;
+}
 
 function loadConfig(): CompressorConfig {
   try {
@@ -78,16 +142,42 @@ function loadConfig(): CompressorConfig {
     const coverage = isValidArr(parsed.coverage, thresholds.length)
       ? parsed.coverage
       : DEFAULT_CONFIG.coverage;
-    return { thresholds, coverage };
+    const cfg: CompressorConfig = { thresholds, coverage };
+    // Auto-migrate stale defaults to current recommended values.
+    // Preserves any non-matching config as explicit user customization.
+    const staleLabel = matchesStaleDefault(cfg);
+    if (staleLabel !== null) {
+      const migrated: CompressorConfig = {
+        thresholds: [...DEFAULT_CONFIG.thresholds],
+        coverage: [...DEFAULT_CONFIG.coverage],
+      };
+      saveConfig(migrated);
+      try {
+        process.stderr.write(
+          `condensed-milk: migrated stale ${staleLabel} defaults in ${CONFIG_PATH} ` +
+          `to current recommended [${migrated.thresholds.join(",")}]×` +
+          `[${migrated.coverage.join(",")}]. To customize, use /compress-config.\n`,
+        );
+      } catch { /* stderr write is best-effort */ }
+      return migrated;
+    }
+    return cfg;
   } catch {
     return { thresholds: [...DEFAULT_CONFIG.thresholds], coverage: [...DEFAULT_CONFIG.coverage] };
   }
 }
 
+/** Merge-preserving write: reads existing config, updates only thresholds and
+ *  coverage, preserves any other keys (e.g. `telemetry`). Prevents v1.7.1
+ *  auto-migration and /compress-config writes from clobbering other fields. */
 function saveConfig(cfg: CompressorConfig): void {
   try {
+    let existing: Record<string, unknown> = {};
+    try { existing = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")); } catch { /* fresh */ }
+    existing.thresholds = cfg.thresholds;
+    existing.coverage = cfg.coverage;
     mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+    writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2) + "\n");
   } catch {
     // Non-fatal — config just won't persist
   }
@@ -154,6 +244,15 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // Config
   let config: CompressorConfig = loadConfig();
 
+  // v1.8.0: telemetry state. Captured regardless of opt-in; written to disk
+  // at session_shutdown ONLY if telemetry.local is true. Zero-cost when off.
+  let telemetryConfig: TelemetryConfig = loadTelemetryConfig();
+  let sessionStartIso = new Date().toISOString();
+  let sessionStartReason: string = "startup";
+  let sessionSessionFile: string | undefined;
+  const toolCounts = new Map<string, number>();
+  const zonesEnteredLog: Array<{ zone: number; at_turn: number; at_ctx_pct: number }> = [];
+
   // Cache tracking
   let cacheHistory: TurnCacheData[] = [];
   let totalCacheRead = 0;
@@ -162,7 +261,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let totalOutput = 0;
   let turnCounter = 0;
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     totalOriginal = 0;
     totalCompressed = 0;
     compressedCount = 0;
@@ -185,11 +284,81 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     totalInput = 0;
     totalOutput = 0;
     turnCounter = 0;
+    // v1.8.0: reset telemetry session state
+    sessionStartIso = new Date().toISOString();
+    sessionStartReason = (event as any)?.reason ?? "startup";
+    sessionSessionFile = (event as any)?.previousSessionFile;
+    toolCounts.clear();
+    zonesEnteredLog.length = 0;
+    // Reload telemetry config at session start so toggle via /compress-telemetry
+    // in a previous session is honored without requiring full pi restart.
+    telemetryConfig = loadTelemetryConfig();
     const cmds = registeredCommands();
     ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
   });
 
+  // v1.8.0: on shutdown, if opt-in, append one JSONL line. Never writes without
+  // explicit opt-in. Runs on graceful shutdown only (Ctrl+C/D, SIGHUP, SIGTERM);
+  // crashed sessions skipped, which is acceptable — we only want clean data.
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    if (!telemetryConfig.local) return;
+    try {
+      const endedIso = new Date().toISOString();
+      const startMs = Date.parse(sessionStartIso);
+      const endMs = Date.parse(endedIso);
+      const durationMs = Number.isFinite(startMs) && Number.isFinite(endMs) ? endMs - startMs : 0;
+      const totalAllInput = totalInput + totalCacheRead + totalCacheWrite;
+      const cacheHitRate = totalAllInput > 0 ? totalCacheRead / totalAllInput : 0;
+      const toolCountsObj: Record<string, number> = {};
+      for (const [k, v] of toolCounts) toolCountsObj[k] = v;
+      const cwdHash = createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16);
+      const sessionIdHash = sessionSessionFile
+        ? createHash("sha256").update(sessionSessionFile).digest("hex").slice(0, 16)
+        : null;
+      const reReads = reReadByRead + reReadByBash;
+      const entry = {
+        schema: TELEMETRY_SCHEMA_VERSION,
+        version: PACKAGE_VERSION,
+        session_id_hash: sessionIdHash,
+        cwd_hash: cwdHash,
+        started_at: sessionStartIso,
+        ended_at: endedIso,
+        duration_ms: durationMs,
+        start_reason: sessionStartReason,
+        final_turn_count: turnCounter,
+        final_ctx_pct: null,  // captured on last context event if available; left null if unknown
+        zones_entered: zonesEnteredLog.slice(),
+        tool_counts: toolCountsObj,
+        mask_events: contextMaskEvents,
+        unique_masks_reads: everMaskedReads.size,
+        unique_masks_bashes: everMaskedBashes.size,
+        re_reads_total: reReads,
+        re_reads_by_read: reReadByRead,
+        re_reads_by_bash: reReadByBash,
+        avg_turns_held: reReads > 0 ? reReadTurnsDeltaSum / reReads : null,
+        thresholds_used: config.thresholds.slice(),
+        coverage_used: config.coverage.slice(),
+        total_tokens_input: totalAllInput,
+        total_cache_read: totalCacheRead,
+        total_cache_write: totalCacheWrite,
+        total_output: totalOutput,
+        cache_hit_rate: cacheHitRate,
+        commands_processed: totalCommands,
+        commands_compressed: compressedCount,
+        bytes_freed: contextSaved,
+      };
+      mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
+      appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
+    } catch {
+      // Silent failure — telemetry must never crash a session shutdown.
+    }
+  });
+
   pi.on("tool_result", async (event, _ctx) => {
+    // v1.8.0: tool-call counter for telemetry (cheap: map increment per event).
+    // Captured unconditionally; only written to disk if opt-in is true.
+    const tn = event.toolName ?? "unknown";
+    toolCounts.set(tn, (toolCounts.get(tn) ?? 0) + 1);
     // v1.4.0: re-read detection for read tool. Uses FIRST-mask turn.
     if (event.toolName === "read") {
       const path = (event.input as { path?: string })?.path;
@@ -328,6 +497,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     if (decision.zoneAdvanced) {
       zoneEntered = decision.activeZone;
       persistentCutoff = decision.cutoffIdx;
+      // v1.8.0: record zone entry for telemetry.
+      zonesEnteredLog.push({
+        zone: decision.activeZone,
+        at_turn: turnCounter,
+        at_ctx_pct: contextUsage,
+      });
     }
 
     const result = compressStaleToolResults(event.messages, {
@@ -544,6 +719,176 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       ctx.ui?.notify?.(`Unknown config key: ${key}. Use thresholds or coverage.`, "warning");
     },
   });
+
+  // /compress-telemetry — v1.8.0 opt-in local telemetry control.
+  // Opt-in verb is deliberately verbose ("enable-local-logging") so it cannot
+  // be triggered accidentally. See ADR-027.
+  pi.registerCommand("compress-telemetry", {
+    description: "Local session telemetry (opt-in, never shared). See full disclosure with no args.",
+    handler: async (args, ctx) => {
+      const sub = (args ?? "").trim().toLowerCase();
+      const current = loadTelemetryConfig();
+      const envOverride = process.env.CONDENSED_MILK_TELEMETRY;
+      const envOverrideActive = envOverride === "on" || envOverride === "off" || envOverride === "1" || envOverride === "0" || envOverride === "true" || envOverride === "false";
+
+      if (!sub) {
+        // Status + full disclosure.
+        const logSize = existsSync(TELEMETRY_LOG_PATH) ? statSync(TELEMETRY_LOG_PATH).size : 0;
+        const logLines = logSize > 0 ? countLines(TELEMETRY_LOG_PATH) : 0;
+        const state = current.local ? "ENABLED (local only)" : "DISABLED";
+        const envNote = envOverrideActive
+          ? `  (currently forced by env var CONDENSED_MILK_TELEMETRY=${envOverride})`
+          : "";
+        const lines = [
+          `Telemetry — currently ${state}${envNote}`,
+          "",
+          "condensed-milk can log per-session summaries to:",
+          `  ${TELEMETRY_LOG_PATH}`,
+          "",
+          "What would be recorded (per session, at graceful shutdown only):",
+          "  · session duration + final turn count",
+          "  · pressure zones entered (turn and ctx% at each)",
+          "  · tool call counts by type (read/bash/edit/grep/etc.)",
+          "  · mask events, unique masks, re-reads, avg placeholder hold",
+          "  · thresholds and coverage in use",
+          "  · cache hit rate + total tokens by bucket",
+          "  · condensed-milk version",
+          "  · sha256-truncated hashes of session file path + cwd (16 chars)",
+          "",
+          "What is NOT recorded:",
+          "  × ANY message or tool output content",
+          "  × file paths or tool inputs (only hashes)",
+          "  × environment variables, API keys, or identity info",
+          "",
+          "Data stays on your machine. No network. No automatic upload.",
+          "Opt-in only — default is OFF, always.",
+          "",
+          current.local
+            ? `Log file: ${TELEMETRY_LOG_PATH}  (${logLines} sessions recorded, ${formatBytes(logSize)})`
+            : "To enable:  /compress-telemetry enable-local-logging",
+          current.local
+            ? "Disable:   /compress-telemetry disable"
+            : "Env alt:   set CONDENSED_MILK_TELEMETRY=on",
+          current.local ? "Export for manual sharing: /compress-telemetry export" : "",
+          current.local ? `View raw:  cat ${TELEMETRY_LOG_PATH} | jq` : "",
+          current.local ? `Delete:    rm ${TELEMETRY_LOG_PATH}` : "",
+        ].filter(Boolean);
+        ctx.ui?.notify?.(lines.join("\n"), "info");
+        return;
+      }
+
+      if (sub === "enable-local-logging") {
+        if (envOverrideActive) {
+          ctx.ui?.notify?.(
+            `Env var CONDENSED_MILK_TELEMETRY=${envOverride} overrides config. Unset it first with: unset CONDENSED_MILK_TELEMETRY`,
+            "warning",
+          );
+          return;
+        }
+        saveTelemetryConfig({ local: true });
+        telemetryConfig = { local: true };
+        ctx.ui?.notify?.(
+          [
+            "Local telemetry ENABLED.",
+            `Writing per-session summaries to ${TELEMETRY_LOG_PATH} on graceful shutdown.`,
+            "Data stays on your machine. Nothing is uploaded.",
+            "",
+            "To disable:  /compress-telemetry disable",
+            "To view:     /compress-telemetry",
+            "To export:   /compress-telemetry export",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "enable" || sub === "on" || sub === "enable-logging") {
+        // Nudge toward the explicit verbose verb to make opt-in deliberate.
+        ctx.ui?.notify?.(
+          [
+            "Opt-in requires the explicit command:",
+            "  /compress-telemetry enable-local-logging",
+            "(verbose verb is deliberate so this cannot be triggered accidentally)",
+          ].join("\n"),
+          "warning",
+        );
+        return;
+      }
+
+      if (sub === "disable" || sub === "off") {
+        if (envOverrideActive) {
+          ctx.ui?.notify?.(
+            `Env var CONDENSED_MILK_TELEMETRY=${envOverride} overrides config. Unset it first with: unset CONDENSED_MILK_TELEMETRY`,
+            "warning",
+          );
+          return;
+        }
+        saveTelemetryConfig({ local: false });
+        telemetryConfig = { local: false };
+        ctx.ui?.notify?.(
+          [
+            "Local telemetry DISABLED.",
+            "No further session summaries will be written.",
+            `Existing log at ${TELEMETRY_LOG_PATH} is untouched. Remove with:  rm ${TELEMETRY_LOG_PATH}`,
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "export") {
+        if (!existsSync(TELEMETRY_LOG_PATH)) {
+          ctx.ui?.notify?.(
+            `No telemetry log exists at ${TELEMETRY_LOG_PATH}. Enable logging first with: /compress-telemetry enable-local-logging`,
+            "warning",
+          );
+          return;
+        }
+        const exportPath = join(homedir(), `condensed-milk-sessions-export-${Date.now()}.jsonl`);
+        try {
+          const raw = readFileSync(TELEMETRY_LOG_PATH, "utf-8");
+          writeFileSync(exportPath, raw);
+          const lineCount = countLines(TELEMETRY_LOG_PATH);
+          ctx.ui?.notify?.(
+            [
+              `Exported ${lineCount} sessions to:`,
+              `  ${exportPath}`,
+              "",
+              "This file is a copy of your local telemetry log, untransformed.",
+              "Review it before sharing:",
+              `  cat ${exportPath} | jq`,
+              "",
+              "It contains no message content or tool output — only session-shape stats.",
+              "You can share it with the condensed-milk author to help improve defaults,",
+              "but nothing is ever uploaded automatically.",
+            ].join("\n"),
+            "info",
+          );
+        } catch (e: any) {
+          ctx.ui?.notify?.(`Export failed: ${e?.message ?? e}`, "warning");
+        }
+        return;
+      }
+
+      ctx.ui?.notify?.(
+        [
+          `Unknown subcommand: ${sub}`,
+          "Valid: (no args) | enable-local-logging | disable | export",
+        ].join("\n"),
+        "warning",
+      );
+    },
+  });
+}
+
+/** Count newline-terminated lines in a file without loading it fully. */
+function countLines(path: string): number {
+  try {
+    const buf = readFileSync(path);
+    let n = 0;
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) n++;
+    return n;
+  } catch { return 0; }
 }
 
 function formatBytes(bytes: number): string {

@@ -2,6 +2,77 @@
 
 All notable changes to condensed-milk.
 
+## [1.8.0] - 2026-04-18
+
+### Added — opt-in local telemetry for per-user threshold adaptation (ADR-027)
+
+New optional feature: condensed-milk can log one JSONL line per session to
+`~/.config/condensed-milk-sessions.jsonl` on graceful shutdown. The data
+feeds an upcoming per-user hierarchical Bayesian horizon predictor
+(session-horizon-aware threshold selection, see project notes). The
+feature is **opt-in only, never default on, stays on the user's machine**,
+and never uploads anywhere.
+
+**Activation (three paths):**
+
+```
+/compress-telemetry enable-local-logging    # explicit slash command
+export CONDENSED_MILK_TELEMETRY=on          # env var alternative
+# or edit ~/.config/condensed-milk.json and add {"telemetry": {"local": true}}
+```
+
+The slash command verb `enable-local-logging` is deliberately verbose so
+it cannot be triggered by a typo. `/compress-telemetry enable` (short form)
+returns a warning explaining the full verb is required.
+
+**What's recorded per session:** session duration, final turn count,
+pressure zones entered (turn + ctx% at each), tool-call counts by type,
+mask events, unique masks, re-reads, avg placeholder hold, thresholds and
+coverage in use, cache hit rate, total tokens by bucket, condensed-milk
+version, and sha256-truncated (16-char) hashes of session path + cwd.
+
+**What's NOT recorded:** any message or tool output content, file paths
+or tool inputs (only hashes), env vars, API keys, or identity info.
+
+**Subcommands:**
+
+```
+/compress-telemetry                        # status + full disclosure
+/compress-telemetry enable-local-logging   # explicit opt-in
+/compress-telemetry disable                # opt-out
+/compress-telemetry export                 # write shareable copy for manual volunteer sharing
+```
+
+The `export` subcommand writes a timestamped copy of the JSONL to your
+home directory. Users who want to help improve condensed-milk defaults
+can review that file and send it to the author manually. No automated
+upload path exists, by design.
+
+### Fixed — v1.7.0 default upgrade silently blocked by stale user config (ADR-026)
+
+**Bug:** users who had `~/.config/condensed-milk.json` auto-persisted from
+v1.6.x or earlier were stuck on old thresholds `[0.20, 0.35, 0.50] ×
+[0.50, 0.75, 0.90]` after upgrading to v1.7.0, because the config loader
+prefers user file over built-in defaults. The v1.7.0 behavioral change
+never took effect unless the user manually edited or deleted the file.
+
+**Fix:** on config load, if the user's thresholds AND coverage exactly
+match any recognized prior-version default tuple, auto-overwrite with
+current `DEFAULT_CONFIG` values and print a one-line stderr migration
+notice. Any config that does not match a known prior default is treated
+as an explicit user customization and preserved untouched.
+
+Known prior defaults currently recognized:
+
+- `v1.6.x`: `[0.20, 0.35, 0.50] × [0.50, 0.75, 0.90]`
+
+Future releases that change defaults should append the prior tuple to
+the `STALE_DEFAULTS` list before bumping `DEFAULT_CONFIG`.
+
+**Impact:** every user running v1.7.0 with a pre-existing config file
+gets auto-migrated to the new recommended defaults on their next session
+start. Explicit user customizations remain untouched.
+
 ## [1.7.0] - 2026-04-17
 
 ### Changed — default thresholds delayed (ADR-025)

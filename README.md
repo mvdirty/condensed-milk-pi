@@ -138,10 +138,12 @@ Controls when and how aggressively masking fires. Single source of truth for cac
 
 ```json
 {
-  "thresholds": [0.20, 0.35, 0.50],
-  "coverage":   [0.50, 0.75, 0.90]
+  "thresholds": [0.30, 0.45, 0.60],
+  "coverage":   [0.60, 0.80, 0.95]
 }
 ```
+
+v1.8.0 auto-migrates configs matching any recognized prior default tuple (e.g. v1.6.x `[0.20, 0.35, 0.50] × [0.50, 0.75, 0.90]`) to the current recommended values on next session start. Customizations (any non-matching tuple) are preserved.
 
 | Field | Meaning |
 |---|---|
@@ -150,7 +152,48 @@ Controls when and how aggressively masking fires. Single source of truth for cac
 
 Also editable via `/compress-config`. Changes take effect on next session.
 
-### 2. Rules — `~/.pi/agent/condensed-milk-config.json` (global) + `./condensed-milk.config.json` (project-local)
+### 2. Telemetry (opt-in, local-only) — `~/.config/condensed-milk-sessions.jsonl`
+
+**Default: off. Never enabled without your explicit action.**
+
+condensed-milk can optionally log one JSONL line per session to the file above
+on graceful shutdown. The data feeds an upcoming per-user threshold adapter.
+It stays on your machine — nothing is uploaded, automatically or otherwise.
+
+**What's recorded per session:** session duration, final turn count, pressure
+zones entered (turn + context% at each), tool-call counts by type, mask
+statistics, thresholds and coverage in use, cache hit rate, total tokens by
+bucket, condensed-milk version, and sha256-truncated (16-char) hashes of the
+session path and cwd.
+
+**What's NOT recorded:** any message or tool output content, file paths or
+tool inputs (only hashes), environment variables, API keys, or identity info.
+
+**Three ways to opt in:**
+
+```
+/compress-telemetry enable-local-logging    # slash command (verbose verb is deliberate)
+export CONDENSED_MILK_TELEMETRY=on          # env var
+```
+
+Or add `{"telemetry": {"local": true}}` to `~/.config/condensed-milk.json`
+(merged with your existing cutoff config).
+
+**Control:**
+
+```
+/compress-telemetry                        # show status + full disclosure
+/compress-telemetry enable-local-logging   # opt in
+/compress-telemetry disable                # opt out
+/compress-telemetry export                 # write a timestamped copy to ~/ for manual sharing
+cat ~/.config/condensed-milk-sessions.jsonl | jq   # view raw
+rm ~/.config/condensed-milk-sessions.jsonl         # delete local log
+```
+
+If you want to help improve defaults, you can review the file and send it to
+the author manually. No automated upload path exists — by design.
+
+### 3. Rules — `~/.pi/agent/condensed-milk-config.json` (global) + `./condensed-milk.config.json` (project-local)
 
 Custom reference files and invalidation rules. Both files optional; when both exist they merge additively (project-local extends global).
 
