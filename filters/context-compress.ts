@@ -242,13 +242,22 @@ export function decideCutoff(
     if (usage >= thresholds[z]) { activeZone = z; break; }
   }
 
+  // v1.8.1 (ADR-028) defense-in-depth: clamp the persisted cutoff to the
+  // current array length. /pi-vcc compaction shrinks messages.length but
+  // does not renumber indices consistently with the old cutoff value.
+  // Without this clamp, every post-compact message sits below the stale
+  // cutoff and all tool_results get masked. With it, at worst a compact
+  // event that we missed degrades to "mask everything prior to the compact
+  // boundary" which is still a correct bound since nothing prior exists.
+  const clampedPreviousCutoff = Math.min(previousCutoff, messagesLength);
+
   // True-static: only compute a new cutoff if we've entered a higher
   // zone than previously seen. Otherwise keep previousCutoff exactly.
-  let cutoffIdx = previousCutoff;
+  let cutoffIdx = clampedPreviousCutoff;
   let zoneAdvanced = false;
   if (activeZone > zoneEntered) {
     const newCutoff = Math.floor(messagesLength * coverage[activeZone]);
-    cutoffIdx = Math.max(previousCutoff, newCutoff);
+    cutoffIdx = Math.max(clampedPreviousCutoff, newCutoff);
     zoneAdvanced = true;
   }
 

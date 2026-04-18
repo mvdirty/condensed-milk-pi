@@ -2,6 +2,50 @@
 
 All notable changes to condensed-milk.
 
+## [1.8.1] - 2026-04-18
+
+### Fixed — post-`/pi-vcc` compaction masked ALL fresh tool output (ADR-028)
+
+**Bug:** after running `/pi-vcc` to compact a session, fresh bash and Read
+tool output in the same session was replaced with placeholder strings
+(`[masked bash] <command>`, `[masked read] <path>`) even though the
+tools executed correctly. Small-output commands (`wc -l`, `grep -c`, etc.)
+appeared unaffected because they fell under the `MIN_MASK_LENGTH = 120`
+byte threshold, giving the misleading impression of a content-based
+classifier. The actual cause was index-based.
+
+**Root cause:** the static-cutoff algorithm (ADR-018) persists `cutoff`
+across turns as an **absolute message index**. `/pi-vcc` compaction
+collapses the messages array from e.g. 600 entries to ~20, but pi does
+not notify condensed-milk of the collapse, so the frozen cutoff (e.g.
+400) remains. Every post-compact message sits at index 0–19, all below
+400, so every tool_result meeting the length gate gets masked.
+
+**Fix — two layers:**
+
+1. **Event-driven reset (primary).** Register a `session_compact` event
+   handler that resets `persistentCutoff = 0`, `zoneEntered = -1`, and
+   clears all re-read trackers and ever-masked sets. The masker starts
+   fresh against the new message baseline and re-enters zones
+   naturally as the post-compact session grows.
+
+2. **Clamp in `decideCutoff` (defense-in-depth).** Clamp the persisted
+   cutoff to the current `messagesLength` on every call. If the
+   `session_compact` event is ever missed (e.g. a custom compaction
+   path pi adds later), the clamp bounds the damage — the worst case
+   degrades to "mask everything up to the current position" rather
+   than "mask everything forever across future growth."
+
+**Regression test:** `test-compact-reset.mjs` — 8 cases verifying the
+clamp, the explicit reset behavior, and the natural zone re-entry
+after reset. Includes a no-regression check confirming the pre-compact
+normal path still masks correctly.
+
+**Reported by:** agent session in `ab-buy` repo that hit the bug
+immediately after `/pi-vcc` at ~42–44% context usage. Diagnostic
+observation that "count-only bash survives" was critical to identifying
+the length-gate mechanism separately from the index mechanism.
+
 ## [1.8.0] - 2026-04-18
 
 ### Added — opt-in local telemetry for per-user threshold adaptation (ADR-027)

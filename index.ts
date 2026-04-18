@@ -81,7 +81,7 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 // Path is separate from CONFIG_PATH so deleting one doesn't disturb the other.
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
 const TELEMETRY_SCHEMA_VERSION = 1;
-const PACKAGE_VERSION = "1.8.0";
+const PACKAGE_VERSION = "1.8.1";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -303,6 +303,35 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     telemetryConfig = loadTelemetryConfig();
     const cmds = registeredCommands();
     ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
+  });
+
+  // v1.8.1 (ADR-028): /pi-vcc compaction collapses the messages array while
+  // the masker's persistentCutoff is frozen at a pre-compact absolute index.
+  // Without this reset, every post-compact tool_result sits below the stale
+  // cutoff and gets masked (symptom: `cat file.md`, Read tool, etc. all return
+  // `[masked bash] <cmd>` / `[masked read] <path>` for fresh content).
+  // Reset all position-based state and re-enter zones naturally on next
+  // context event that crosses a threshold.
+  pi.on("session_compact", async (_event, _ctx) => {
+    persistentCutoff = 0;
+    zoneEntered = -1;
+    // Clear mask trackers: placeholders in compact summary aren't tracked by
+    // us, and re-read telemetry should restart clean since the
+    // "original placeholder turn" recorded in these maps no longer
+    // corresponds to a real message index post-compact.
+    maskedReadPaths.clear();
+    maskedBashCommands.clear();
+    everMaskedReads.clear();
+    everMaskedBashes.clear();
+    reReadByRead = 0;
+    reReadByBash = 0;
+    reReadTurnsDeltaSum = 0;
+    // Context mask counters reset so /compress-stats reflects post-compact
+    // state rather than showing a carryover cutoff index that no longer
+    // corresponds to any message in the array.
+    contextSaved = 0;
+    contextMaskEvents = 0;
+    contextMasksTotal = 0;
   });
 
   // v1.8.0: on shutdown, if opt-in, append one JSONL line. Never writes without
