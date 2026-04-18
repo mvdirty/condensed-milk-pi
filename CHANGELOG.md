@@ -2,6 +2,70 @@
 
 All notable changes to condensed-milk.
 
+## [1.7.0] - 2026-04-17
+
+### Changed — default thresholds delayed (ADR-025)
+
+Bumped default cutoff thresholds and coverage after multi-session sweep:
+
+```
+thresholds:  [0.20, 0.35, 0.50]  →  [0.30, 0.45, 0.60]
+coverage:    [0.50, 0.75, 0.90]  →  [0.60, 0.80, 0.95]
+```
+
+### Why
+
+Sweep across 4 real sessions (455–1205 turns, covering code-work and
+research workloads) tested 12 threshold×coverage combinations. Results:
+
+| Session | Turns | Old default | New default | Savings |
+|---|---|---|---|---|
+| ols-research | 455 | $116.21 | $115.60 | -0.5% |
+| mojo-template-pi-dev | 1205 | $1608.79 | $1597.06 | -0.7% |
+| funding-sting (long code session) | 670 | $348.69 | $282.26 | **-19.0%** |
+| funding-sting (older) | 668 | $177.40 | $175.67 | -1.0% |
+
+Never worse, sometimes dramatically better. The outlier 19% win is on
+long code-work sessions with heavy post-zone-2 traffic — the previous
+thresholds crystallized the cutoff too early, leaving a growing tail of
+un-masked messages after the session continued past zone 2 entry.
+Delayed thresholds wait for larger `ti` values at zone entry → larger
+final cutoffs (`floor(ti * coverage)`) → more messages masked deeper in
+the session.
+
+### Counterintuitive finding
+
+My original hypothesis for ADR-020 (deferred in Feb) was that EARLIER
+triggering (`T.15/.30/.45`) would help — more masking time, more savings.
+Data falsified this. `T.15` is strictly *worse* than `T.20` on every
+session tested (by 0.02–0.9%). Reason: earlier zones fire at smaller
+`ti` values, yielding smaller cutoffs in absolute terms.
+
+### Cache-safety
+
+No regressions. Variant counts stayed flat (or decreased by 1) across
+all 4 sessions tested. Static-cutoff invariant holds as designed.
+
+### Override if needed
+
+Short-session workloads or agents that need aggressive early masking
+can override via `~/.config/condensed-milk.json`:
+
+```json
+{
+  "thresholds": [0.20, 0.35, 0.50],
+  "coverage":   [0.50, 0.75, 0.90]
+}
+```
+
+Or via `/compress-config thresholds 0.20,0.35,0.50` at runtime.
+
+### References
+
+- ADR-020 (v1.3.0) — original defer, now resolved
+- ADR-025 (v1.7.0) — supersedes ADR-020 with measured data
+- `knowledge/findings/adr-020-sweep-and-bash-invalidation-audit.md`
+
 ## [1.6.1] - 2026-04-17
 
 ### Fixed — re-read rate display (>100% confusion)

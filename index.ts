@@ -50,16 +50,19 @@ import { stripAnsi } from "./filters/ansi-strip.js";
 // Migration from v1.1.x: windowSize silently ignored.
 interface CompressorConfig {
   /** Context-usage thresholds (monotonically increasing, 0..1) that
-   *  trigger cutoff advancement. Default [0.20, 0.35, 0.50]. */
+   *  trigger cutoff advancement. Default [0.30, 0.45, 0.60] as of v1.7.0
+   *  (ADR-025). Users targeting short sessions can override via
+   *  `~/.config/condensed-milk.json`. */
   thresholds: number[];
   /** Coverage fractions at each threshold — fraction of messages to
-   *  mask when that threshold fires. Must match thresholds length. */
+   *  mask when that threshold fires. Must match thresholds length.
+   *  Default [0.60, 0.80, 0.95] as of v1.7.0. */
   coverage: number[];
 }
 
 const DEFAULT_CONFIG: CompressorConfig = {
-  thresholds: [0.20, 0.35, 0.50],
-  coverage:   [0.50, 0.75, 0.90],
+  thresholds: [0.30, 0.45, 0.60],
+  coverage:   [0.60, 0.80, 0.95],
 };
 
 const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
@@ -490,8 +493,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
             `  coverage:   [${config.coverage.join(", ")}]`,
             "",
             "Usage:",
-            "  /compress-config thresholds 0.20,0.35,0.50   # context-% triggers (monotonic)",
-            "  /compress-config coverage 0.50,0.75,0.90     # mask fraction per trigger",
+            "  /compress-config thresholds 0.30,0.45,0.60   # context-% triggers (monotonic)",
+            "  /compress-config coverage 0.60,0.80,0.95     # mask fraction per trigger",
             "",
             "How it works: cutoff T advances only when context usage crosses a",
             "threshold. Bytes before T stay byte-identical turn-over-turn —",
@@ -505,7 +508,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       if (key === "thresholds" || key === "coverage") {
         const arr = value.split(/[\s,]+/).filter(Boolean).map(Number);
         if (arr.length === 0 || arr.some((n) => !Number.isFinite(n) || n < 0 || n > 1)) {
-          ctx.ui?.notify?.(`Usage: /compress-config ${key} 0.20,0.35,0.50  (values in [0,1])`, "warning");
+          ctx.ui?.notify?.(`Usage: /compress-config ${key} 0.30,0.45,0.60  (values in [0,1])`, "warning");
           return;
         }
         // Check monotonic

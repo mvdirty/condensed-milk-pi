@@ -17,19 +17,35 @@
  * Rolling window was actively harmful (more expensive than no masking).
  * Static cutoff saves 16% vs rolling and 5% vs no-masking baseline.
  *
+ * v1.7.0 (ADR-025): delayed thresholds [0.30/0.45/0.60] with coverage
+ * [0.60/0.80/0.95] measured 0.5–19% cheaper than prior [0.20/0.35/0.50]
+ * × [0.50/0.75/0.90] across 4 real sessions. Biggest wins on long
+ * sessions with heavy post-zone-2 traffic. See
+ * knowledge/findings/adr-020-sweep-and-bash-invalidation-audit.md.
+ *
  * Why masking over summarization still holds (ADR-016): deterministic
  * byte-identical placeholders, JetBrains empirical advantage, agent
  * re-reads via just-in-time pattern.
  */
 
 /** Context-usage thresholds that trigger cutoff advancement.
- *  Must be monotonically increasing. JetBrains-adjacent pressure curve. */
-const DEFAULT_THRESHOLDS: readonly number[] = [0.20, 0.35, 0.50];
+ *  Must be monotonically increasing.
+ *
+ *  v1.7.0 (ADR-025): delayed from [0.20, 0.35, 0.50] to [0.30, 0.45, 0.60]
+ *  after multi-session sweep found it saves 0.5–19% across real workloads
+ *  with no regressions. Biggest wins on long sessions that continue past
+ *  zone 2 entry — current-default cutoffs crystallize too early relative
+ *  to how much session is still coming. Users targeting short sessions
+ *  can override via `~/.config/condensed-milk.json`. */
+const DEFAULT_THRESHOLDS: readonly number[] = [0.30, 0.45, 0.60];
 
 /** Coverage at each threshold — fraction of current messages masked
  *  when that threshold first fires. Monotonically increasing.
- *  Length MUST match DEFAULT_THRESHOLDS. */
-const DEFAULT_COVERAGE: readonly number[] = [0.50, 0.75, 0.90];
+ *  Length MUST match DEFAULT_THRESHOLDS.
+ *
+ *  v1.7.0: bumped to [0.60, 0.80, 0.95] (from [0.50, 0.75, 0.90]).
+ *  Higher coverage was consistent 0.2–0.4% win on all sessions tested. */
+const DEFAULT_COVERAGE: readonly number[] = [0.60, 0.80, 0.95];
 
 /** Minimum tool-result size to mask. Below this, placeholder ≈ content → no win. */
 const MIN_MASK_LENGTH = 120;
