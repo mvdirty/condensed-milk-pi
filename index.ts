@@ -83,6 +83,14 @@ const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.j
 const TELEMETRY_SCHEMA_VERSION = 1;
 const PACKAGE_VERSION = "1.8.0";
 
+/** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
+ *  extension (e.g. user-installed third-party tools with identifying names)
+ *  is bucketed into "other" to prevent leaking custom tool identifiers —
+ *  even into local logs. Extend this list as pi ships new built-in tools. */
+const ALLOWED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "bash", "read", "edit", "write", "grep", "find", "ls", "multiedit", "notebook_read", "notebook_edit",
+]);
+
 interface TelemetryConfig {
   local: boolean;
 }
@@ -357,7 +365,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   pi.on("tool_result", async (event, _ctx) => {
     // v1.8.0: tool-call counter for telemetry (cheap: map increment per event).
     // Captured unconditionally; only written to disk if opt-in is true.
-    const tn = event.toolName ?? "unknown";
+    const rawTn = event.toolName ?? "unknown";
+    const tn = ALLOWED_TOOL_NAMES.has(rawTn) ? rawTn : "other";
     toolCounts.set(tn, (toolCounts.get(tn) ?? 0) + 1);
     // v1.4.0: re-read detection for read tool. Uses FIRST-mask turn.
     if (event.toolName === "read") {
@@ -836,7 +845,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         return;
       }
 
-      if (sub === "export") {
+      if (sub === "export" || sub === "export-raw") {
         if (!existsSync(TELEMETRY_LOG_PATH)) {
           ctx.ui?.notify?.(
             `No telemetry log exists at ${TELEMETRY_LOG_PATH}. Enable logging first with: /compress-telemetry enable-local-logging`,
@@ -844,23 +853,58 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           );
           return;
         }
-        const exportPath = join(homedir(), `condensed-milk-sessions-export-${Date.now()}.jsonl`);
+        const anonymize = sub === "export";  // default: anonymize. "export-raw" opts into keeping hashes.
+        const suffix = anonymize ? "anonymized" : "raw";
+        const exportPath = join(homedir(), `condensed-milk-sessions-export-${suffix}-${Date.now()}.jsonl`);
         try {
           const raw = readFileSync(TELEMETRY_LOG_PATH, "utf-8");
-          writeFileSync(exportPath, raw);
+          let output: string;
+          if (anonymize) {
+            // Replace session_id_hash and cwd_hash with sequential IDs. Brute-forcing
+            // a 64-bit hash against known candidates is possible for a recipient
+            // who knows the user's repo/session patterns; sequential IDs close that.
+            const sessionIdMap = new Map<string, string>();
+            const cwdMap = new Map<string, string>();
+            const lines = raw.split("\n").filter(Boolean);
+            const out: string[] = [];
+            for (const line of lines) {
+              try {
+                const obj = JSON.parse(line) as Record<string, unknown>;
+                if (typeof obj.session_id_hash === "string") {
+                  const h = obj.session_id_hash;
+                  if (!sessionIdMap.has(h)) sessionIdMap.set(h, `session_${String(sessionIdMap.size + 1).padStart(4, "0")}`);
+                  obj.session_id_hash = sessionIdMap.get(h);
+                }
+                if (typeof obj.cwd_hash === "string") {
+                  const h = obj.cwd_hash;
+                  if (!cwdMap.has(h)) cwdMap.set(h, `cwd_${String.fromCharCode(65 + (cwdMap.size % 26))}${cwdMap.size >= 26 ? Math.floor(cwdMap.size / 26) : ""}`);
+                  obj.cwd_hash = cwdMap.get(h);
+                }
+                out.push(JSON.stringify(obj));
+              } catch {
+                // Skip malformed lines rather than failing whole export
+              }
+            }
+            output = out.join("\n") + "\n";
+          } else {
+            output = raw;
+          }
+          writeFileSync(exportPath, output);
           const lineCount = countLines(TELEMETRY_LOG_PATH);
           ctx.ui?.notify?.(
             [
               `Exported ${lineCount} sessions to:`,
               `  ${exportPath}`,
               "",
-              "This file is a copy of your local telemetry log, untransformed.",
-              "Review it before sharing:",
+              anonymize
+                ? "Anonymized export: session_id_hash and cwd_hash replaced with sequential IDs."
+                : "Raw export: original hashes preserved (use /compress-telemetry export for anonymized).",
+              "No message content or tool output in either format — only session-shape stats.",
+              "",
+              "Review before sharing:",
               `  cat ${exportPath} | jq`,
               "",
-              "It contains no message content or tool output — only session-shape stats.",
-              "You can share it with the condensed-milk author to help improve defaults,",
-              "but nothing is ever uploaded automatically.",
+              "No automated upload exists. You share this file manually or not at all.",
             ].join("\n"),
             "info",
           );
@@ -873,7 +917,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       ctx.ui?.notify?.(
         [
           `Unknown subcommand: ${sub}`,
-          "Valid: (no args) | enable-local-logging | disable | export",
+          "Valid: (no args) | enable-local-logging | disable | export | export-raw",
         ].join("\n"),
         "warning",
       );
